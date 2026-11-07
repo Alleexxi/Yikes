@@ -1,7 +1,7 @@
-"""Unencrypted version-11 Unreal PAK indexes and block-compressed members.
+"""Version-4/8/11 Unreal PAK indexes and block-compressed/AES-encrypted members.
 
 Encoded-entry dimensions were cross-checked against CUE4Parse and nxnative's
-dm/gfx/tools/uepak.py. Encrypted or unsupported variants remain explicit gaps.
+dm/gfx/tools/uepak.py. Keys require index-hash validation before use.
 """
 
 import hashlib
@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from .binary import LIMIT, span, unpack
 from .iostore import decode_block
 from .large import Window, window
+from .unreal_crypto import KeyProbe, decrypt
 
 MAGIC = bytes.fromhex('e1126f5a')
 
@@ -39,6 +40,16 @@ class Cursor:
             raise ValueError('Unterminated Unreal FString')
         return raw.decode('utf-16-le' if size < 0 else 'utf-8').rstrip('\0')
 
+    def utf8(self):
+        """A length-prefixed UTF-8 name without a terminator (PAK v12 directory file names)."""
+        size = self.take('<i')
+        if not 0 < size <= 4096:
+            raise ValueError('Invalid Unreal UTF-8 name length')
+        raw = self.read(size)
+        if 0 in raw:
+            raise ValueError('Unexpected terminator in an Unreal UTF-8 name')
+        return raw.decode('utf-8')
+
     def count(self, minimum):
         """Reject negative counts or arrays that cannot fit even their smallest records."""
         count = self.take('<i')
@@ -50,18 +61,25 @@ class Cursor:
 class Pak:
     """Resolve filenames from the full directory index, preserving every member."""
 
-    def __init__(self, data):
-        self.data = data
+    def __init__(self, data, key_provider=None):
+        self.data, self.key = data, None
         footer = next((len(data) - back for back in (0xcc, 0xc8, 0x2c)
                        if len(data) >= back + 1 and data[len(data) - back:len(data) - back + 4] == MAGIC), None)
         if footer is None:
             raise ValueError('Unrecognized Unreal PAK footer')
         version, offset, size = unpack(data, '<IQQ', footer + 4)
         self.version, self.legacy = version, {}
-        if version not in (4, 8, 11):
+        if version not in (4, 8, 11, 12):  # 12 keeps version 11's footer and index layout
             raise ValueError(f'Unsupported Unreal PAK version {version}')
-        if data[footer - 1]:
-            raise ValueError('Encrypted Unreal PAK indexes are not supported')
+        self.encrypted_index = bool(data[footer - 1])
+        if self.encrypted_index:
+            if key_provider is None:
+                raise ValueError('Encrypted Unreal PAK needs a validated index key')
+            probe = KeyProbe(span(data, offset, (size + 15) & ~15), size,
+                             expected_hash=span(data, footer + 24, 20))
+            self.key = key_provider(probe)
+            if not probe.accepts(self.key):
+                raise ValueError('Unreal PAK key did not validate its index SHA-1')
         self.methods = (['none', 'zlib', 'gzip', 'lz5', 'custom'] if version == 4 else
                         ['none'] + [data[footer + 44 + i * 32:footer + 76 + i * 32]
                                     .rstrip(b'\0').decode('ascii').lower() for i in range(5)])
@@ -98,7 +116,8 @@ class Pak:
         for _ in range(directory.count(8)):
             folder = directory.string()
             for _ in range(directory.count(8)):
-                name, entry = folder + directory.string(), directory.take('<i')
+                name = folder + (directory.utf8() if self.version >= 12 else directory.string())
+                entry = directory.take('<i')
                 if entry == -1:  # Tombstone, not a file.
                     continue
                 if name in self.files or not 0 <= entry < len(self.encoded):
@@ -109,7 +128,9 @@ class Pak:
 
     def verified(self, offset, size, expected):
         """Validate the primary/directory index SHA-1 before trusting entry offsets."""
-        raw = span(self.data, offset, size)
+        raw = span(self.data, offset, (size + 15) & ~15 if self.encrypted_index else size)
+        if self.encrypted_index:
+            raw = decrypt(raw, self.key)[:size]
         if hashlib.sha1(raw).digest() != expected:
             raise ValueError('Unreal PAK index SHA-1 mismatch')
         return raw
@@ -133,13 +154,20 @@ class Pak:
                 length = packed if blocks == 1 and not encrypted else r.take('<I')
                 ranges.append((at, length))
                 at += (length + 15) & ~15 if encrypted else length
-        if encrypted:
-            raise ValueError('Encrypted Unreal PAK members are not supported')
+        if encrypted and self.key is None:
+            raise ValueError('Encrypted Unreal PAK member has no validated index key')
         if method >= len(self.methods) or not self.methods[method]:
             raise ValueError('Invalid Unreal PAK compression method')
-        if not method:
+        if not size and not packed and not blocks:
+            yield b''
+            return
+        if not method and not encrypted:
             yield window(self.data, offset + 53, size)
             return
+        if not method:
+            ranges = [(offset + 53 + at, min(1024 * 1024, size - at))
+                      for at in range(0, size, 1024 * 1024)]
+            blocks, block_size = len(ranges), 1024 * 1024
         if not blocks:
             raise ValueError('Compressed Unreal PAK member has no blocks')
         block_size = block_size or (size if blocks == 1 else 0)
@@ -148,12 +176,15 @@ class Pak:
         consumed = 0
         with tempfile.SpooledTemporaryFile(max_size=LIMIT) as output:
             for at, length in ranges:
-                raw = span(self.data, at, length)
+                raw = span(self.data, at, (length + 15) & ~15 if encrypted else length)
+                if encrypted:
+                    raw = decrypt(raw, self.key)[:length]
                 expected = min(block_size, size - output.tell())
                 output.write(decode_block(raw, expected, self.methods[method], decode_native))
-                consumed += length
+                consumed += (length + 15) & ~15 if encrypted and method else length
             if consumed != packed or output.tell() != size:
-                raise ValueError('Unreal PAK member size mismatch')
+                raise ValueError(f'Unreal PAK member size mismatch: packed {consumed}/{packed}; '
+                                 f'decoded {output.tell()}/{size}; method {method}; encrypted {encrypted}')
             if size <= LIMIT:
                 output.seek(0)
                 yield output.read()

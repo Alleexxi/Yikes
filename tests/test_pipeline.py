@@ -331,6 +331,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(audit_call.call_count, 2)
 
+    def test_parallel_batch_matches_serial_extraction_and_reports_each_game(self):
+        folder = self.root / 'games'
+        folder.mkdir()
+        make_nup(folder / 'small.nup', [('p0', archive([shader()]))])
+        make_nup(folder / 'big.nup', [(f'p{i}', archive([shader(), shader(stage='cs')])) for i in range(6)])
+        # The fake emulator makes every audit fail, so what is checked is the process machinery:
+        # both games scan in their own process, are reported, logged and bundled.
+        result = run_batch(folder, self.root / 'results', 'fake-emulator', jobs=2, workers=1)
+        self.assertEqual(result, 2)
+        serial = scan_input(folder / 'big.nup', self.root / 'serial', False, workers=1)
+        parallel = self.root / 'results' / 'big'
+        self.assertEqual((serial / 'native-audit.tsv').read_bytes(), (parallel / 'native-audit.tsv').read_bytes())
+        self.assertTrue((self.root / 'results' / 'small' / 'shaders.sqlite').is_file())
+        for name in ('big', 'small'):
+            self.assertIn('Scan complete', (self.root / 'results' / 'logs' / f'{name}.nup.log').read_text(encoding='utf-8'))
+        with zipfile.ZipFile(next((self.root / 'results').glob('batch-results-*.zip'))) as archive_file:
+            entries = json.loads(archive_file.read('batch.json'))['entries']
+        self.assertEqual([entry['name'] for entry in entries], ['big.nup', 'small.nup'])
+        for entry in entries:
+            self.assertEqual(entry['status'], 'error')
+            self.assertIn('translator', entry['error'])
+            self.assertGreaterEqual(entry['seconds'], 0)
+            self.assertIn('peak_working_set_mb', entry)
+        with self.assertRaises(ValueError):
+            run_batch(folder, self.root / 'results2', 'fake-emulator', jobs=0)
+
     @unittest.skipUnless(Path(os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')).is_dir(), 'Emulator checkout needed')
     def test_batch_can_explicitly_audit_partial_extraction_and_keeps_gaps_in_zip(self):
         folder = self.root / 'games'

@@ -165,9 +165,11 @@ Only those codec files are compiled. Older checkpoints revisit failed members an
 unclaimed controls when the parser revision changes.
 
 Ray-tracing BNSH modules are preserved as `.rt.bin` NRTM envelopes containing their complete
-control metadata and code. They are included in regression ZIPs and reported as unsupported modules.
-Their instruction ranges are not yet decoded, so the auditor does not send their metadata or
-constant data through the instruction lowerer. These are explicit audit failures, not silently skipped shaders.
+control metadata and code. The auditor reads the module's function table (raygen continuations,
+closest-hit, miss) from the control record, checks that the functions exactly cover the code and that
+every continuation relocation names its expected `MOV` instruction, then lowers each function on its
+own. Error offsets are relative to the module's code. Modules whose table cannot be verified are
+reported as `malformed ray tracing module` rejections, never silently skipped.
 
 Each audit gets its own directory under `audits/`, containing `report.json`, `REPORT.md`, raw
 `lowering.tsv` and `build-metadata.json`. `latest.json` points to the most recent completed audit.
@@ -180,9 +182,24 @@ at runtime cannot be exhaustively promised by static extraction. Zero recognized
 does not prove that every possible shader format was understood.
 
 Zero extracted native shaders stops the audit with an explicit error; it is not a compatibility
-pass. Encrypted Unreal containers, IoStore shader-library/group layouts, serialized Unreal
-shader-code libraries, encrypted UnityFS bundles and legacy UnityWeb/UnityRaw/UnityArchive bundles
-remain explicit extraction gaps until their respective formats are supported. A low nonzero count
+pass. The scanner reads ZIP/VZIP members (including VZIP's chained LZ4 chunks), version-one
+Unreal IoStore shader libraries/groups (20- or 8-byte hash tables), serialized `.ushaderbytecode`
+archives (version 2, also as unnamed IoStore chunks), LZ4/Oodle/zlib inline Unreal shader tables,
+headed Oodle/zlib shader streams in cooked packages and global shader caches, PAK versions 4, 8,
+11 and 12, and Snowdrop v43 SDF slices with their matching file index. Large decoded assets use
+temporary storage; ZIP CRCs, NUP hashes and Unreal index hashes are checked. A shader stream is
+only accepted when it decodes to its declared size and is a valid length-checked record, so data
+that merely contains a codec's magic is ignored. XNA/FNA Direct3D 9 effects (`.fxb`) are counted
+and reported as "nothing to audit": the game translates them at runtime.
+
+Encrypted Unreal PAK/IoStore data can be decoded when a key recovered from that package's own
+verified `main` NSO passes the archive index's SHA-1 or complete directory-structure validation.
+Keys stay in memory and are never logged, checkpointed or bundled. No external key list is used.
+An unrecognized key layout or failed validation remains an explicit extraction gap.
+
+Unsupported SDF versions/codecs, encrypted UnityFS
+bundles and legacy UnityWeb/UnityRaw/UnityArchive bundles remain explicit gaps. Failed archive
+decompression and unresolved shader records also keep extraction incomplete. A low nonzero count
 can still miss an unrecognized format.
 
 ## Setup on another checkout/computer
@@ -219,6 +236,9 @@ if the configured emulator checkout is absent. No game data is included in tests
 The scanner packages the local TotK extraction research. Container reading is adapted from the local
 NUP reference reader. Format details were checked against
 https://github.com/seedds/nxnative/blob/main/dm/gfx/tools/shader_split.py; that external script is not
-executed. The audit adapter uses the selected emulator's existing translator, retaining its license
+executed. Additional layout references are nxnative's `uepak.py`,
+https://github.com/trumank/retoc/blob/master/retoc/src/shader_library.rs and
+https://github.com/drakmor/SnowplowCLI/blob/master/SnowplowCLI/SDFS.cs.
+The audit adapter uses the selected emulator's existing translator, retaining its license
 and attribution notices in the generated local copy. Runtime output may contain copyrighted game
 data; keep it private as intended.

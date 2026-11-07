@@ -64,8 +64,8 @@ def bea(payload, unpacked):
     return bytes(data)
 
 
-def ray_bnsh():
-    """Build a stage-8 module whose code must not be treated as a normal compute shader."""
+def ray_bnsh(declared_size=16):
+    """Build a stage-8 module with a one-function table; code must not be read as compute."""
     data = bytearray(0x410)
     data[:8] = b'BNSH\0\0\0\0'
     struct.pack_into('<I', data, 0x1c, len(data))
@@ -73,13 +73,17 @@ def ray_bnsh():
     struct.pack_into('<IQ', data, 0x7c, 1, 0x100)
     struct.pack_into('<Q', data, 0x110, 0x140)
     struct.pack_into('<Q', data, 0x178, 0x1a0)
-    struct.pack_into('<QQII', data, 0x1a8, 0x220, 0x400, 16, 0xe0)
-    control = bytearray(0xe0)
+    struct.pack_into('<QQII', data, 0x1a8, 0x220, 0x400, 16, 0x120)
+    control = bytearray(0x120)
     control[:8] = bytes.fromhex('34127698c9000000')
     struct.pack_into('<I', control, 0x30, len(control))
     struct.pack_into('<I', control, 0x44, len(EXIT))
     control[0x56] = 8
-    data[0x220:0x300] = control
+    # Function table: base pointer at 0xd8; one function at 0 with its declared size, no relocations.
+    struct.pack_into('<Q', control, 0xd8, 0xe0)
+    struct.pack_into('<III', control, 0xf0, 1, 0x38, 0x3c)
+    struct.pack_into('<II', control, 0x118, 0, declared_size)
+    data[0x220:0x340] = control
     data[0x400:] = EXIT
     return bytes(data)
 
@@ -228,27 +232,32 @@ class LargeTests(unittest.TestCase):
             decoder.close()
 
     @unittest.skipUnless(Path(os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')).is_dir(), 'Emulator checkout needed')
-    def test_ray_modules_are_preserved_and_reported_without_fake_opcode_failures(self):
+    def test_ray_module_function_tables_are_validated_and_lowered(self):
         source = self.root / 'ray.nup'
         make_nup(source, [('ray', ray_bnsh())])
         output = scan_input(source, self.root / 'ray', False)
         self.assertEqual(verify_manifest(output)[0], 1)
         raw = list(extraction_programs(output))[0][3]
         self.assertEqual(raw[:4], b'NRTM')
-        self.assertEqual(struct.unpack_from('<3I', raw, 4), (1, 0xe0, 16))
-        self.assertEqual(raw[16 + 0xe0:16 + 0xe0 + 16], EXIT)
+        self.assertEqual(struct.unpack_from('<3I', raw, 4), (1, 0x120, 16))
+        self.assertEqual(raw[16 + 0x120:16 + 0x120 + 16], EXIT)
+        report, _ = audit(output, os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine'))
+        self.assertEqual(report['counts'], {'accepted': 1})
+        self.assertEqual(report['cases'][0]['stage'], 'rt')
+        broken = self.root / 'broken.nup'
+        make_nup(broken, [('ray', ray_bnsh(declared_size=32))])
+        output = scan_input(broken, self.root / 'broken', False)
         report, _ = audit(output, os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine'))
         self.assertEqual(report['counts'], {'rejected': 1})
         case = report['cases'][0]
-        self.assertEqual(case['stage'], 'rt')
         self.assertIsNone(case['error_offset'])
         self.assertEqual(case['opcode'], '')
-        self.assertIn('instruction ranges are not decoded', case['reason'])
+        self.assertIn('functions do not cover the code', case['reason'])
         packet = create_task(output, samples=1)
         self.assertIn('NRTM', (packet / 'TASK.md').read_text())
         games = self.root / 'games'
         games.mkdir()
-        make_nup(games / 'ray.nup', [('ray', ray_bnsh())])
+        make_nup(games / 'ray.nup', [('ray', ray_bnsh(declared_size=32))])
         bundled = self.root / 'bundled'
         emulator = os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')
         self.assertEqual(run_batch(games, bundled, emulator), 1)

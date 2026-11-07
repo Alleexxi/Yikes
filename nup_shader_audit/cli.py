@@ -13,7 +13,9 @@ from pathlib import Path
 from . import __version__
 from .container.format import NupError
 from .corpus import uses_native_files
-from .adapter import ROOT
+from .adapter import ROOT, build_adapter
+from .batchjobs import run_parallel
+from .codecs import build_decoder
 from .audit import audit, load_report
 from .scanner import SCANNER_REVISION, Scanner
 from .storage import atomic_json, source_identity
@@ -108,9 +110,70 @@ def find_nups(folder):
                           key=lambda path: str(path).casefold())
 
 
+def prepare_shared_builds(emulator):
+    """Build the audit adapter and Oodle decoder once, so parallel workers only find them cached."""
+    try:
+        build_adapter(emulator)
+    except ValueError as exc:
+        print(f'Note: audit adapter not prepared ({exc}); each game will report its own result',
+              file=sys.stderr, flush=True)
+    try:
+        build_decoder()
+    except ValueError:
+        pass  # Only needed (and only buildable) for Oodle/ZBIC archives on Windows.
+
+
+def run_parallel_batch(folder, nups, entries, output_root, emulator, allow_incomplete,
+                       checkpoint_every, workers, export_native, jobs, batch_progress):
+    """Process the NUPs on `jobs` processes, largest first; returns (failures, incomplete, rejected)."""
+    prepare_shared_builds(emulator)
+    log_root = output_root / 'logs'
+    for nup in nups:
+        relative = nup.relative_to(folder)
+        entries.append({'name': relative.as_posix(), 'output': output_root / relative.with_suffix(''),
+                        'status': 'cancelled'})
+    order = sorted(range(len(nups)), key=lambda i: nups[i].stat().st_size, reverse=True)
+    pending = []
+    for i in order:
+        output = entries[i]['output']
+        pending.append((i, {'nup': str(nups[i]), 'output': str(output),
+                            'resume': (output / 'shaders.sqlite').is_file(),
+                            'checkpoint_every': checkpoint_every, 'workers': workers,
+                            'export_native': export_native, 'emulator': str(emulator),
+                            'allow_incomplete': allow_incomplete,
+                            'log': str(log_root / entries[i]['name']) + '.log'}))
+    print(f'Running {len(nups)} NUPs on {min(jobs, len(nups))} processes (largest first); '
+          f'per-game progress is in {log_root}', flush=True)
+    counts = {'failures': 0, 'incomplete': 0, 'rejected': 0, 'done': 0}
+
+    def finished(index, result):
+        entry = entries[index]
+        entry.update(result)
+        counts['done'] += 1
+        position = f'[{counts["done"]}/{len(nups)}]'
+        timing = f'{result.get("seconds", 0):.0f}s, peak {result.get("peak_working_set_mb")} MiB'
+        if result['status'] == 'error':
+            counts['failures'] += 1
+            print(f'{position} FAILED {entry["name"]} ({timing}): {result["error"]}',
+                  file=sys.stderr, flush=True)
+        else:
+            counts['rejected'] += result['rejected']
+            gaps = not result['coverage_complete_for_recognized_formats']
+            counts['incomplete'] += gaps
+            print(f'{position} finished {entry["name"]} ({timing}): {result["total"]} shaders, '
+                  f'{result["rejected"]} rejected' + ('; WARNING: extraction has coverage gaps' if gaps else ''),
+                  flush=True)
+        batch_progress(counts['done'], len(nups))
+
+    run_parallel(jobs, pending, finished)
+    return counts['failures'], counts['incomplete'], counts['rejected']
+
+
 def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
-              checkpoint_every=5000, workers=4, export_native=False):
+              checkpoint_every=5000, workers=4, export_native=False, jobs=1):
     """Scan and audit every NUP under a folder, continuing after individual failures."""
+    if jobs < 1:
+        raise ValueError('--jobs must be at least 1')
     folder, nups = find_nups(folder)
     if not nups:
         raise ValueError(f'No .nup files found under {folder}')
@@ -123,34 +186,39 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
     batch_progress = make_progress(f'Batch ({len(nups)} NUPs)')
     entries = []
     try:
-        for index, nup in enumerate(nups, 1):
-            relative_output = nup.relative_to(folder).with_suffix('')
-            output = output_root / relative_output
-            entry = {'name': nup.relative_to(folder).as_posix(), 'output': output, 'status': 'cancelled'}
-            entries.append(entry)
-            print(f'\n[{index}/{len(nups)}] {nup}', flush=True)
-            try:
-                output = scan_input(nup, output, resume=(output / 'shaders.sqlite').is_file(),
-                                    checkpoint_every=checkpoint_every, workers=workers,
-                                    export_native=export_native)
-                report, directory = audit(output, selected_emulator, allow_incomplete=allow_incomplete)
-                rejected = report['counts'].get('rejected', 0)
-                rejected_total += rejected
-                coverage_complete = report['coverage_complete_for_recognized_formats']
-                if not coverage_complete:
-                    incomplete += 1
-                entry.update(status='completed', rejected=rejected, total=report['total'],
-                             coverage_complete_for_recognized_formats=coverage_complete,
-                             report_directory=directory)
-                print(f'[{index}/{len(nups)}] finished: {report["total"]} shaders, '
-                      f'{rejected} rejected'
-                      + ('; WARNING: extraction has coverage gaps' if not coverage_complete else '')
-                      + f'; report: {directory / "REPORT.md"}', flush=True)
-            except (ValueError, OSError, NupError, sqlite3.Error, struct.error, RuntimeError) as exc:
-                failures += 1
-                entry.update(status='error', error=str(exc))
-                print(f'[{index}/{len(nups)}] FAILED: {exc}', file=sys.stderr, flush=True)
-            batch_progress(index, len(nups))
+        if jobs > 1 and len(nups) > 1:
+            failures, incomplete, rejected_total = run_parallel_batch(
+                folder, nups, entries, output_root, selected_emulator, allow_incomplete,
+                checkpoint_every, workers, export_native, jobs, batch_progress)
+        else:
+            for index, nup in enumerate(nups, 1):
+                relative_output = nup.relative_to(folder).with_suffix('')
+                output = output_root / relative_output
+                entry = {'name': nup.relative_to(folder).as_posix(), 'output': output, 'status': 'cancelled'}
+                entries.append(entry)
+                print(f'\n[{index}/{len(nups)}] {nup}', flush=True)
+                try:
+                    output = scan_input(nup, output, resume=(output / 'shaders.sqlite').is_file(),
+                                        checkpoint_every=checkpoint_every, workers=workers,
+                                        export_native=export_native)
+                    report, directory = audit(output, selected_emulator, allow_incomplete=allow_incomplete)
+                    rejected = report['counts'].get('rejected', 0)
+                    rejected_total += rejected
+                    coverage_complete = report['coverage_complete_for_recognized_formats']
+                    if not coverage_complete:
+                        incomplete += 1
+                    entry.update(status='completed', rejected=rejected, total=report['total'],
+                                 coverage_complete_for_recognized_formats=coverage_complete,
+                                 report_directory=directory)
+                    print(f'[{index}/{len(nups)}] finished: {report["total"]} shaders, '
+                          f'{rejected} rejected'
+                          + ('; WARNING: extraction has coverage gaps' if not coverage_complete else '')
+                          + f'; report: {directory / "REPORT.md"}', flush=True)
+                except (ValueError, OSError, NupError, sqlite3.Error, struct.error, RuntimeError) as exc:
+                    failures += 1
+                    entry.update(status='error', error=str(exc))
+                    print(f'[{index}/{len(nups)}] FAILED: {exc}', file=sys.stderr, flush=True)
+                batch_progress(index, len(nups))
     finally:
         if entries:
             archive = write_batch_bundle(output_root, entries, progress=make_progress('Packing shaders'))
@@ -162,7 +230,7 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
     return 2 if failures or incomplete else (1 if rejected_total else 0)
 
 
-def tui():
+def tui(workers=4, jobs=1):
     """Interactive folder picker and batch runner for terminal use."""
     print('Yikes — nx2-experimental shader audit\n')
     folder = input('Folder containing NUP files (searched recursively): ').strip().strip('"')
@@ -180,7 +248,7 @@ def tui():
     if answer not in ('', 'y', 'yes'):
         print('Cancelled.')
         return 0
-    return run_batch(resolved)
+    return run_batch(resolved, workers=workers, jobs=jobs)
 
 
 def parser():
@@ -213,6 +281,8 @@ def parser():
                       help='Also write individual native .bin files for each game')
     part.add_argument('folder', type=Path)
     part.add_argument('-o', '--output', type=Path, help='Root folder for per-NUP results')
+    part.add_argument('--jobs', type=int, default=1, metavar='N',
+                      help='Scan and audit N NUPs at once, one process each (default: 1)')
     part.add_argument('--emulator', type=Path)
     coverage = part.add_mutually_exclusive_group()
     coverage.add_argument('--allow-incomplete', action='store_true', default=False,
@@ -231,7 +301,11 @@ def parser():
     part = subs.add_parser('configure', help='Save the default emulator checkout locally')
     part.add_argument('--emulator', type=Path, required=True)
     subs.add_parser('update', help='Clone or fast-forward the managed nx2-experimental checkout')
-    subs.add_parser('tui', help='Interactive terminal UI for choosing a folder and auditing all NUPs')
+    part = subs.add_parser('tui', help='Interactive terminal UI for choosing a folder and auditing all NUPs')
+    part.add_argument('--workers', type=int, default=4,
+                      help='Parallel read/decompression/hash workers (default: 4; 1 disables prefetch)')
+    part.add_argument('--jobs', type=int, default=1, metavar='N',
+                      help='Scan and audit N NUPs at once, one process each (default: 1)')
     return command
 
 
@@ -255,10 +329,11 @@ def main(arguments=None):
             print(f'Updated {emulator} to {git("-C", emulator, "rev-parse", "HEAD")}')
             return 0
         if args.command == 'tui':
-            return tui()
+            return tui(args.workers, args.jobs)
         if args.command == 'batch':
             return run_batch(args.folder, args.output, args.emulator,
-                             args.allow_incomplete, args.checkpoint_every, args.workers, args.export_native)
+                             args.allow_incomplete, args.checkpoint_every, args.workers, args.export_native,
+                             args.jobs)
         if args.command in ('scan', 'run'):
             output = scan_input(args.nup, args.output, args.resume, args.checkpoint_every,
                                 args.workers, args.export_native)

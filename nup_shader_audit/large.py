@@ -3,6 +3,7 @@
 import hashlib
 import mmap
 import tempfile
+import zlib
 from contextlib import contextmanager
 
 import zstandard
@@ -143,6 +144,34 @@ def decoded_zstd(data, dictionary=None, expected_size=None):
                 value = Window(mapped)
                 value.decoded_hash = decoded_hash.hexdigest()
                 yield value
+
+
+@contextmanager
+def decoded_zlib(data, expected):
+    """Decode a complete length-delimited zlib stream with bounded output chunks."""
+    decoder = zlib.decompressobj()
+    with tempfile.SpooledTemporaryFile(max_size=LIMIT) as output:
+        at, pending = 0, b''
+        while not decoder.eof:
+            if not pending:
+                pending = data[at:at + CHUNK]
+                at += len(pending)
+                if not pending:
+                    raise ValueError('Truncated zlib stream')
+            value = decoder.decompress(pending, CHUNK)
+            pending = decoder.unconsumed_tail
+            if output.tell() + len(value) > expected:
+                raise ValueError('Zlib output exceeds declared size')
+            output.write(value)
+        if at != len(data) or decoder.unused_data or output.tell() != expected:
+            raise ValueError('Zlib stream length/decoded size mismatch')
+        if expected <= LIMIT:
+            output.seek(0)
+            yield output.read()
+        else:
+            output.flush()
+            with mmap.mmap(output.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                yield Window(mapped)
 
 
 @contextmanager

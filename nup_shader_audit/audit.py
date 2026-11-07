@@ -184,6 +184,11 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
     print('Verifying extracted shader hashes...', flush=True)
     expected, corpus_hash = verify_manifest(output)
     if not expected:
+        effects = extraction.get('stats', {}).get('fna_effects', 0)
+        if effects and coverage_complete:
+            raise ValueError(f'Nothing to audit: the package ships {effects} XNA/FNA Direct3D 9 effect '
+                             'files (.fxb) that the game translates at runtime, and no native Switch 2 '
+                             'shaders. This is not a shader compatibility pass.')
         raise ValueError('No native shaders were extracted; no instruction audit was performed. '
                          'This is not a shader compatibility pass.')
     portable_sources = None
@@ -216,7 +221,7 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
     with (connect(output) if portable_sources is None else nullcontext(None)) as db:
         for row in cases:
             if row['stage'] == 'rt':
-                row['representation'] = 'ray_tracing_module_with_control_metadata'
+                row['representation'] = 'ray_tracing_module_functions'
             row['error_offset'] = int(row['error_offset']) if row['error_offset'] else None
             row['input_bytes'] = int(row['input_bytes'])
             row['consumed_bytes'] = int(row['consumed_bytes'])
@@ -237,7 +242,8 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
                          'Only native-to-Maxwell lowering is tested; acceptance does not prove rendering correctness.',
                          'Only the first rejection in each program is reported.']}
     if any(row['stage'] == 'rt' for row in cases):
-        report['limits'].append('Ray tracing modules include full control metadata and code, but their instruction ranges are not decoded or lowered.')
+        report['limits'].append('Ray tracing modules are lowered function by function from their declared table; '
+                                 'driver-patched continuation immediates are verified but left zero, and the first rejection is relative to module code.')
     if baseline:
         report['comparison'] = compare_reports(load_report(baseline), report)
         report['baseline'] = str(Path(baseline).resolve())

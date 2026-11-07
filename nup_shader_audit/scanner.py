@@ -22,13 +22,18 @@ import zstandard
 from .binary import LIMIT, check_range, decompress, ray_module, span, unpack, walk
 from .container.read import NupReader
 from .markers import MarkerFinder
-from .large import Window, decoded_lz4, decoded_yaz0, decoded_zstd, digest, window
+from .large import Window, decoded_lz4, decoded_yaz0, decoded_zstd, decoded_zlib, digest, window
 from .codecs import NativeDecoder
 from .trinity import entries as trinity_entries
 from .bea import members as bea_members
-from .iostore import MAGIC as IOSTORE, IoStore
-from .unreal import record as unreal_record, shader_tables
+from .iostore import MAGIC as IOSTORE, IoStore, decode_block
+from .unreal import OODLE, ZLIB, adjacent as unreal_adjacent, record as unreal_record, shader_tables
 from .unreal_pak import MAGIC as PAK_MAGIC, Pak
+from .zip_archive import ZipArchive
+from .unreal_crypto import find_key
+from .snowdrop import Snowdrop
+from .unreal_library import library as shader_library, group_programs
+from .unreal_archive import looks_like as shader_archive_like, parse as shader_archive, program as archive_program
 from .unity import (bundle_members as unity_bundle, is_serialized as is_unity_asset,
                     objects as unity_objects, graphics_programs, compute_programs,
                     program_ranges as unity_program_ranges, text_asset, read_shader)
@@ -39,7 +44,7 @@ ZSTD = bytes.fromhex("28b52ffd")
 LZ4 = bytes.fromhex("04224d18")
 NATIVE = CONTROL + bytes.fromhex("c9000000")
 SHORT = ("vs", "hs", "ds", "gs", "ps", "cs", "ts", "ms", "rt")
-SCANNER_REVISION = 8
+SCANNER_REVISION = 10
 
 
 def plausible_control_header(header):
@@ -198,6 +203,8 @@ class Scanner:
         self.magics = Counter()
         self.extensions = Counter()
         self.dictionaries = {}
+        self.key_provider = None
+        self.snowdrop_archives = {}
         self.started = time.monotonic()
         self.elapsed_before_resume = 0
         self.existing_roots = {}
@@ -237,7 +244,7 @@ class Scanner:
                 revisit.update(row[0] for row in self.db.execute(
                     "SELECT DISTINCT p.path FROM origins o JOIN paths p ON p.hash=o.blob WHERE o.format='BAHS'"))
                 revisit.update(path for path in roots if path.endswith(
-                    ('.ucas', '.utoc', '.pak', '.bundle', '.unity3d', '.ushaderbytecode')))
+                    ('.ucas', '.utoc', '.pak', '.bundle', '.unity3d', '.ushaderbytecode', '.zip', '.sdfdata', '.sdftoc')))
                 unity_roots = {path.rsplit('/', 1)[0] + '/' for path in roots
                                if path.endswith(('/globalgamemanagers', '/globalgamemanagers.assets'))}
                 revisit.update(path for path in roots if any(path.startswith(prefix) for prefix in unity_roots))
@@ -440,18 +447,19 @@ class Scanner:
             claimed.add(self.add(data, blob, label, "BAHS", stage, c, nc, k, nk, hex(a)))
         self.stats["BAHS_containers"] += 1
 
-    def ndsr(self, data, blob, label, claimed):
+    def ndsr(self, data, blob, label, claimed, base=0):
         def score(start):
             result = 0
             for at in range(start, min(start + 256, len(data) - 15), 16):
-                c, _, _, _ = unpack(data, "<4I", at)
-                result += data[c:c + 8] == NATIVE
+                c, _, _, _ = unpack(data, "<4I", base + at)
+                result += data[base + c:base + c + 8] == NATIVE
             return result
         offset = max((0x10, 0x14), key=score)
-        while offset + 16 <= len(data):
-            c, nc, k, nk = unpack(data, "<4I", offset)
+        while base + offset + 16 <= len(data):
+            c, nc, k, nk = unpack(data, "<4I", base + offset)
             if not (c or nc or k or nk):
                 break
+            c, k = base + c, base + k
             if data[c:c + 8] != NATIVE:
                 offset += 8
                 continue
@@ -504,19 +512,111 @@ class Scanner:
                         self.db.execute('INSERT OR IGNORE INTO paths VALUES (?,?)', (name, cached))
                         self.stats['duplicate_blobs'] += 1
                     else:
-                        decoded = self.decode_native('oodle', raw, size) if packed != size else raw
+                        if packed == size:
+                            decoded = raw
+                        elif raw[:1] == b'\x8c':
+                            decoded = self.decode_native('oodle', raw, size)
+                        else:
+                            # LZ4's bound also prevents a corrupt size from causing an
+                            # arbitrary allocation before the native record is proved.
+                            if size > 255 * packed:
+                                raise ValueError('Impossible Unreal LZ4 expansion ratio')
+                            decoded = None
+                            if (len(raw) >= 2 and raw[0] & 15 == 8 and raw[0] >> 4 <= 7
+                                    and int.from_bytes(raw[:2], 'big') % 31 == 0):
+                                # A zlib stream (Unreal 4.26's default); an LZ4 token can look
+                                # like its header, so a failure falls through to LZ4.
+                                try:
+                                    decoded = decode_block(raw, size, 'zlib', None)
+                                except (ValueError, zlib.error):
+                                    decoded = None
+                            if decoded is None:
+                                decoded = lz4.block.decompress(raw, uncompressed_size=size)
                         c = decoded.find(NATIVE)
-                        unreal_record(decoded, c)
+                        try:
+                            unreal_record(decoded, c)
+                        except ValueError:
+                            unreal_adjacent(decoded, c)  # Ray-tracing modules: code follows control.
                         self.scan(decoded, name, depth + 1)
                         self.unreal_decoded[key] = digest(decoded)
                     valid = True
                     self.stats['unreal_inline_shaders'] += 1
                     ranges.append((at, at + packed))
-                except (ValueError, OSError, RuntimeError) as exc:
+                except (ValueError, OSError, RuntimeError, lz4.block.LZ4BlockError) as exc:
+                    if not valid and raw[:1] != b'\x8c':
+                        self.stats['unreal_table_nonrecords'] += 1
+                        break
                     self.issue(name, 'unreal_shader', exc)
             if valid:
                 end = rows[-1][0] + rows[-1][1] + 5
+        ranges.extend(self.unreal_streams(data, label, depth, ranges))
         return sorted(ranges)
+
+    def unreal_streams(self, data, label, depth, taken):
+        """Decode headed compressed streams that hold shader records, outside counted tables.
+
+        Some builds store each shader in a cooked package or global cache as one stream with its
+        own small header: Oodle behind (raw size, flags, packed size, 0), zlib behind
+        (0, frequency, raw size, 0, packed size). The header only nominates a stream: it counts
+        when it decodes to exactly its declared size and the result is a valid length-checked
+        record, so ordinary data that happens to contain a codec's magic is ignored.
+        """
+        ranges, positions = [], set()
+        for magic in OODLE + ZLIB:
+            at = data.find(magic, 20)
+            while at >= 0:
+                positions.add(at)
+                at = data.find(magic, at + 2)
+        for start in sorted(positions):
+            if any(low <= start < high for low, high in taken):
+                continue
+            oodle = data[start] == 0x8c
+            if oodle:
+                raw_size, flags, packed, zero = unpack(data, '<4I', start - 16)
+                header = start - 16
+                valid = not zero and flags <= 0xff
+            else:
+                zero_a, frequency, raw_size, zero_b, packed = unpack(data, '<5I', start - 20)
+                header = start - 20
+                valid = not zero_a and not zero_b and frequency <= 15
+            if (not valid or not 16 <= packed < raw_size <= 0x1000000 or raw_size > 32 * packed
+                    or start + packed > len(data)):
+                continue
+            stream = span(data, start, packed)
+            key = (hashlib.sha256(stream).digest(), raw_size)
+            name = label + f'#ue-stream@{start:x}'
+            try:
+                cached = self.unreal_decoded.get(key)
+                if cached is not None:
+                    self.db.execute('INSERT OR IGNORE INTO paths VALUES (?,?)', (name, cached))
+                    self.stats['duplicate_blobs'] += 1
+                else:
+                    if oodle:
+                        decoded = self.decode_native('oodle', stream, raw_size)
+                    else:
+                        decoded = decode_block(stream, raw_size, 'zlib', None)
+                    control = decoded.find(NATIVE)
+                    try:
+                        unreal_record(decoded, control)
+                    except ValueError:
+                        unreal_adjacent(decoded, control)
+                    self.scan(decoded, name, depth + 1)
+                    self.unreal_decoded[key] = digest(decoded)
+                self.stats['unreal_streams'] += 1
+                ranges.append((header, start + packed))
+            except (ValueError, OSError, RuntimeError, struct.error, zlib.error):
+                self.stats['unreal_stream_nonrecords'] += 1
+        return ranges
+
+    def unreal_program(self, program, name, depth, frequency):
+        """Scan one declared Unreal shader; a shader without a native control is a gap, not a skip."""
+        before = self.stats['UNREAL_NVN2_references']
+        self.scan(program, name, depth + 1, unreal=True)
+        # Duplicate program blobs are already covered by their original parse.
+        if (self.stats['UNREAL_NVN2_references'] == before
+                and not any(program[c:c + 8] == NATIVE for c in self.marker_finder.find(program)[CONTROL])):
+            self.issue(name, 'unsupported_shader_record',
+                       f'No native control found in declared shader (frequency {frequency})')
 
     def unity_asset(self, data, label, depth):
         """Extract typed shader objects without matching compressed asset bytes as controls."""
@@ -550,6 +650,11 @@ class Scanner:
             self.bahs(data, blob, label, claimed)
         elif data[:4] == b"NDSR":
             self.ndsr(data, blob, label, claimed)
+        elif data[:4] == b'VIPR':
+            offset = 0
+            while (offset := data.find(b'NDSR\0\x01', offset)) >= 0:
+                self.ndsr(data, blob, label, claimed, offset)
+                offset += 6
         for base in markers[b"BNSH\0\0\0\0"]:
             try:
                 if not self.bnsh(data, blob, label, base, claimed):
@@ -557,6 +662,13 @@ class Scanner:
             except (ValueError, struct.error) as exc:
                 self.issue(label + f"#BNSH@{base:x}", "shader_parser", exc)
         self.glslc(data, blob, label, claimed, markers[bytes.fromhex("91688619")])
+        # Viper stores one code area before its control section, with explicit lengths.
+        if data[:4] == bytes.fromhex('91688619') and len(data) >= 24:
+            code_size, control_size, reserved = unpack(data, '<3I', 4)
+            c = 24 + code_size
+            if (not reserved and c + control_size == len(data) and data[c:c + 8] == NATIVE):
+                claimed.add(self.add(data, blob, label, 'VIPER_NVN2', None,
+                                     c, control_size, 24, code_size))
         # sead primitive drawer: four absolute file offsets in the first sixteen bytes.
         if len(data) >= 16:
             cv, cp, kv, kp = unpack(data, "<4I", 0)
@@ -590,7 +702,7 @@ class Scanner:
                 try:
                     own, = unpack(data, "<I", c + 0x30)
                     length, = unpack(data, "<I", c + 0x44)
-                    if 0x58 <= own < 0x10000:
+                    if 0x58 <= own <= 0x1000000:
                         claimed.add(self.add(data, blob, label, "ADJACENT_NVN2", None,
                                              c, own, c + own, length, hex(c)))
                         continue
@@ -628,14 +740,15 @@ class Scanner:
                     self.stats["embedded_frames_decoded"] += 1
 
     def scan(self, data, label, depth=0, *, verified_hash=None, iostore=None, unreal=False,
-             unity_program=False, stage_hint=None):
+             unity_program=False, stage_hint=None, sdf=None):
         if depth > 16:
             raise ValueError("nesting limit")
         blob = verified_hash if verified_hash is not None else digest(data)
         self.db.execute("INSERT OR IGNORE INTO paths VALUES (?,?)", (label, blob))
         # The same UCAS payload can have a different TOC in another package.
         # Its logical chunk ranges must be interpreted using that package's metadata.
-        context = (blob, digest(iostore[0].data), iostore[1]) if iostore is not None else None
+        context = ((blob, digest(iostore[0].data), iostore[1]) if iostore is not None else
+                   (blob, sdf[2], sdf[1]) if sdf is not None else None)
         duplicate = context in self.iostore_seen if context is not None else blob in self.seen
         if duplicate:
             self.stats["duplicate_blobs"] += 1
@@ -649,17 +762,68 @@ class Scanner:
         if unity_program:
             for stage, c, nc, k, nk in unity_program_ranges(data, stage_hint):
                 self.add(data, blob, label, 'UNITY', stage, c, nc, k, nk)
+        elif sdf is not None:
+            archive, part, _ = sdf
+            for ordinal, (asset, offset, size, pages, extent) in enumerate(archive.partition(part), 1):
+                name = label + '/' + asset + f'#extent-{extent}'
+                try:
+                    with archive.read(data, offset, size, pages, self.decode_native) as value:
+                        self.scan(value, name, depth + 1)
+                    self.stats['snowdrop_extents'] += 1
+                except Exception as exc:
+                    self.issue(name, 'snowdrop_asset', exc)
+                if ordinal % 10000 == 0:
+                    print(f'SDF: {ordinal} assets; {len(self.written_native)} native programs; '
+                          f'{len(self.issues)} issues', flush=True)
+        elif data[:4] == b'WEST' and label.endswith('.sdftoc'):
+            if blob not in self.snowdrop_archives:
+                self.snowdrop_archives[blob] = Snowdrop(data)
+                self.snowdrop_archives[blob].index()
+        elif label.endswith('.sdfdata'):
+            raise ValueError('SDFDATA requires its matching SDFTOC file index')
         elif iostore is not None:
             toc, partition, read_partition = iostore
             self.stats['iostore_partitions'] += 1
+            shader_groups = {}
+            valid_libraries = set()
+            # Libraries may follow their groups in the TOC and may live in another
+            # physical partition. Resolve their descriptors before walking this slice.
+            if toc.version >= 4:
+                for index in range(toc.count):
+                    chunk_id = span(toc.data, toc.header + index * 12, 12)
+                    if chunk_id[-1] != 8:
+                        continue
+                    name = label + '#io-' + chunk_id.hex()
+                    try:
+                        with toc.read(index, read_partition, self.decode_native) as value:
+                            groups = shader_library(value)
+                        for key, descriptor in groups.items():
+                            if key in shader_groups and shader_groups[key] != descriptor:
+                                raise ValueError('Conflicting IoStore shader-library group descriptors')
+                            shader_groups[key] = descriptor
+                        self.stats['iostore_shader_libraries'] += 1
+                        valid_libraries.add(index)
+                    except Exception as exc:
+                        self.issue(name, 'unsupported_shader_library', exc)
             for ordinal, (index, chunk_id, size) in enumerate(toc.entries(partition), 1):
                 name = label + '#io-' + chunk_id.hex()
                 try:
                     with toc.read(index, read_partition, self.decode_native) as value:
-                        self.scan(value, name, depth + 1, unreal=True)
-                    if toc.version >= 4 and chunk_id[11] in (8, 9):
-                        self.issue(name, 'unsupported_shader_library',
-                                   'IoStore shader-library/group instruction ranges are not decoded')
+                        if toc.version >= 4 and chunk_id[-1] == 8:
+                            if index not in valid_libraries:
+                                self.scan(value, name, depth + 1, unreal=True)
+                            continue  # Validated in the metadata pass above.
+                        if toc.version >= 4 and chunk_id[-1] == 9:
+                            if chunk_id not in shader_groups:
+                                self.scan(value, name, depth + 1, unreal=True)
+                                raise ValueError('IoStore shader group has no validated library descriptor')
+                            for shader_index, frequency, program in group_programs(
+                                    value, shader_groups[chunk_id], self.decode_native):
+                                self.unreal_program(program, name + f'#shader-{shader_index}',
+                                                    depth, frequency)
+                            self.stats['iostore_shader_groups'] += 1
+                        else:
+                            self.scan(value, name, depth + 1, unreal=True)
                     self.stats['iostore_chunks'] += 1
                 except (ValueError, OSError, RuntimeError, zlib.error, zstandard.ZstdError) as exc:
                     self.issue(name, 'iostore_chunk', exc)
@@ -667,7 +831,41 @@ class Scanner:
                     print(f'IoStore: {ordinal}/{toc.count} chunks; {len(self.written_native)} native programs; '
                           f'{len(self.issues)} issues', flush=True)
         elif data[:16] == IOSTORE:
-            IoStore(data)  # Validate metadata; raw TOC bytes are not shader records.
+            IoStore(data, self.key_provider)  # Raw TOC bytes are not shader records.
+        elif data[:4] in (b'VZIP', b'PK\x03\x04', b'PK\x05\x06'):
+            archive = ZipArchive(data)
+            try:
+                self.stats['zip_archives'] += 1
+                for ordinal, info in enumerate(archive.archive.infolist(), 1):
+                    if info.is_dir():
+                        continue
+                    name = label + f'#zip-{ordinal}/' + info.filename
+                    try:
+                        with archive.read(info) as member:
+                            self.scan(member, name, depth + 1)
+                        self.stats['zip_members'] += 1
+                    except Exception as exc:
+                        self.issue(name, 'zip_member', exc)
+                    if ordinal % 5000 == 0:
+                        print(f'ZIP: {ordinal}/{len(archive.archive.infolist())} members; '
+                              f'{len(self.written_native)} native programs; {len(self.issues)} issues', flush=True)
+            finally:
+                archive.close()
+        elif data[:4] == bytes.fromhex('ef02bcda'):
+            size, packed = unpack(data, '<II', 12)
+            # Lookup indexes share the magic but begin with a counted hexadecimal
+            # name, rather than the shader cache's reserved word and size pair.
+            name_length, = unpack(data, '<I', 8)
+            first_name = data[12:12 + name_length] if 0 < name_length <= len(data) - 12 else b''
+            lookup = bool(first_name) and all(c in b'0123456789abcdefABCDEF' for c in first_name)
+            if not size or lookup:
+                self.leaf(data, blob, label, depth)
+            elif len(data) != 20 + packed:
+                raise ValueError('Snowdrop shader-cache wrapper length mismatch')
+            else:
+                with decoded_zlib(Window(data, 20, packed), size) as value:
+                    self.scan(value, label + '#snowdrop-cache', depth + 1)
+            self.stats['snowdrop_shader_caches'] += 1
         elif data[:4] == ZSTD:
             self.stats["zstd_layers"] += 1
             params = zstandard.get_frame_parameters(data[:18])
@@ -741,8 +939,19 @@ class Scanner:
                     self.scan(member, label + "/" + name, depth + 1)
                 except Exception as exc:
                     self.issue(label + "/" + name, "nested_member", exc)
-        elif label.endswith('.ushaderbytecode'):
-            self.issue(label, 'unsupported_shader_library', 'Serialized Unreal shader-code library is not decoded')
+        elif label.endswith('.fxb') and data[:4] == bytes.fromhex('0109fffe'):
+            # XNA/FNA Direct3D 9 effect: shader model 2/3 bytecode the game translates at runtime.
+            self.stats['fna_effects'] += 1
+        elif label.endswith('.ushaderbytecode') or (unreal and shader_archive_like(data)):
+            shaders, code = shader_archive(data)
+            self.stats['unreal_shader_archives'] += 1
+            for index, shader in enumerate(shaders):
+                name = label + f'#shader-{index}'
+                try:
+                    program = archive_program(data, shader, code, self.decode_native)
+                    self.unreal_program(program, name, depth, shader[3])
+                except (ValueError, OSError, RuntimeError, zlib.error, zstandard.ZstdError) as exc:
+                    self.issue(name, 'unreal_shader', exc)
         elif data[:8] == b'UnityFS\0':
             self.stats['unity_bundles'] += 1
             with unity_bundle(data) as members:
@@ -757,17 +966,49 @@ class Scanner:
             self.unity_asset(data, label, depth)
         elif (label.endswith('.pak') or any(data[len(data) - back:len(data) - back + 4] == PAK_MAGIC
                                            for back in (0xcc, 0xc8, 0x2c) if len(data) >= back + 1)):
-            archive = Pak(data)
+            archive = Pak(data, self.key_provider)
             self.stats['unreal_paks'] += 1
-            for name in archive.files:
+            for ordinal, name in enumerate(archive.files, 1):
                 try:
                     with archive.read(name, self.decode_native) as value:
                         self.scan(value, label + '/' + name, depth + 1, unreal=True)
                     self.stats['unreal_pak_files'] += 1
                 except (ValueError, OSError, RuntimeError, zlib.error, zstandard.ZstdError) as exc:
                     self.issue(label + '/' + name, 'unreal_pak_member', exc)
+                if ordinal % 1000 == 0:
+                    print(f'PAK: {ordinal}/{len(archive.files)} files; {len(self.written_native)} native programs; '
+                          f'{len(self.issues)} issues', flush=True)
         else:
             self.leaf(data, blob, label, depth, unreal=unreal)
+
+    @contextmanager
+    def snowdrop_root(self, reader, members, label):
+        """Pair SDF slices with verified sibling metadata and a reusable temporary index."""
+        if not label.endswith('.sdfdata'):
+            yield None
+            return
+        match = re.search(r'sdf-([A-Z])-([0-9]+)(?:-[^/]+)?\.sdfdata$', label)
+        toc_name = label.rsplit('/', 1)[0] + '/sdf.sdftoc'
+        if match is None or toc_name not in members:
+            raise ValueError('SDFDATA has no supported name/matching SDFTOC')
+        index = members[toc_name]
+        expected = reader.files[index][2].hex()
+        if expected not in self.snowdrop_archives:
+            with reader.open_file(index) as data:
+                if digest(data) != expected:
+                    raise ValueError('SDFTOC NUP member SHA-256 mismatch')
+                archive = Snowdrop(data)
+                self.snowdrop_archives[expected] = archive
+                archive.index()
+        archive = self.snowdrop_archives[expected]
+        available = {int(found[1]) for name in members
+                     if name.rsplit('/', 1)[0] == label.rsplit('/', 1)[0]
+                     and (found := re.search(r'sdf-[A-Z]-([0-9]+)(?:-[^/]+)?\.sdfdata$', name))}
+        missing = {row[0] for row in archive.db.execute('SELECT DISTINCT part FROM ranges')} - available
+        if missing:
+            raise ValueError('Missing SDFDATA slices referenced by the index: '
+                             + ', '.join(map(str, sorted(missing))))
+        yield archive, int(match[2]), expected
 
     @contextmanager
     def iostore_root(self, reader, members, label, data):
@@ -787,7 +1028,7 @@ class Scanner:
             metadata = stack.enter_context(reader.open_file(index))
             if digest(metadata) != reader.files[index][2].hex():
                 raise ValueError('IoStore TOC NUP member SHA-256 mismatch')
-            toc = IoStore(metadata)
+            toc = IoStore(metadata, self.key_provider)
             if partition >= toc.parts:
                 raise ValueError('UCAS partition exceeds TOC partition count')
             opened = {partition: data}
@@ -867,6 +1108,31 @@ class Scanner:
             if len(all_members) != reader.file_count or len({index for _, index in all_members}) != reader.file_count:
                 raise ValueError("NUP roots do not form a complete tree of distinct file nodes")
             member_indices = dict(all_members)
+            package_keys = {}
+
+            def recover_key(package, probe):
+                """Keep validated keys in memory and recover only from this package's verified main."""
+                for key in package_keys.get(package, []):
+                    if probe.accepts(key):
+                        return key
+                main = package + '/exefs/main'
+                if main not in member_indices:
+                    raise ValueError('Encrypted Unreal archive has no package main for local key recovery')
+                index = member_indices[main]
+                with reader.open_file(index) as module:
+                    if digest(module) != reader.files[index][2].hex():
+                        raise ValueError('Unreal key-source NSO SHA-256 mismatch')
+                    if module[:4] != b'NSO0':
+                        raise ValueError('Unreal key source is not an NSO')
+                    text_size, = unpack(module, '<I', 0x18)
+                    data_start, = unpack(module, '<I', 0x24)
+                    address, size = unpack(module, '<II', 0x34)
+                    print('Validating local Unreal archive key from package main...', flush=True)
+                    with nso_image(module, self.decode_native) as image:
+                        check_range(image, data_start, address + size - data_start)
+                        key = find_key(image, text_size, data_start, address + size, probe)
+                package_keys.setdefault(package, []).append(key)
+                return key
             package_dictionaries = {package.index: {} for package in reader.packages}
             for name, index in all_members:
                 if name.endswith("/Pack/ZsDic.pack.zs"):
@@ -904,16 +1170,18 @@ class Scanner:
                 self.unclaimed = [row for row in self.unclaimed if not (row['path'] == name or row['path'].startswith(name + '#') or row['path'].startswith(name + '/'))]
                 # Interrupted and failed roots may have partial descendants in the checkpoint.
                 if previous_status is not None:
-                    for path, digest in self.db.execute("SELECT path,hash FROM paths WHERE path>=? AND path<?", (name, name+'\uffff')):
+                    for path, blob_hash in self.db.execute("SELECT path,hash FROM paths WHERE path>=? AND path<?", (name, name+'\uffff')):
                         if path == name or path.startswith(name+'#') or path.startswith(name+'/'):
-                            self.seen.discard(digest)
+                            self.seen.discard(blob_hash)
                 try:
+                    self.key_provider = lambda probe, package=name.split('/')[0]: recover_key(package, probe)
                     with self.root_data(reader, index, future) as (value, actual):
                         if actual != node[2].hex():
                             raise ValueError("NUP member SHA-256 mismatch")
                         issues_before = len(self.issues)
-                        with self.iostore_root(reader, member_indices, name, value) as iostore:
-                            self.scan(value, name, verified_hash=actual, iostore=iostore)
+                        with (self.iostore_root(reader, member_indices, name, value) as iostore,
+                              self.snowdrop_root(reader, member_indices, name) as sdf):
+                            self.scan(value, name, verified_hash=actual, iostore=iostore, sdf=sdf)
                     if len(self.issues) != issues_before:
                         status = 'failed'
                     else:
@@ -955,6 +1223,8 @@ class Scanner:
         self.db.close()
         if self.native_decoder is not None:
             self.native_decoder.close()
+        for archive in self.snowdrop_archives.values():
+            archive.close()
 
     def write_summary(self, source, count, final):
         """Commit authoritative progress before publishing readable status files."""
