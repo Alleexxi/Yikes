@@ -122,6 +122,15 @@ code, commit, push or publish. Fixes happen in the coding agent's normal reviewe
   and NSO segments. Dictionary IDs are scoped per NUP package.
 - Parses BNSH, BAHS, NDSR, GLSLC and adjacent native control/code layouts, including executable-embedded
   programs. Unsupported compression or unrecognized formats can still leave coverage gaps.
+- Opens unencrypted Unreal IoStore UTOC/UCAS pairs (TOC versions 1–8), including partitioned data,
+  and PAK versions 4, 8 and 11. Decodes each asset's blocks and inline Oodle-compressed native
+  shader tables, preserving the original code/control records. Both generations of sead primitive
+  shaders are retained. Previously opaque Unreal roots are revisited when resuming older scans.
+- Reads UnityFS bundles and standalone serialized assets using UnityPy 1.25.4's versioned type trees.
+  Decompresses all graphics platform segments, separates code entries from parameter blobs, and
+  extracts compute kernel variants and binary TextAssets. Supports six-stage NVN and nine-stage
+  NVN2 program descriptors. Only completely read shader objects seed the layout-hash schema cache;
+  the cache is saved in checkpoints for resumed scans. Unsupported layouts remain explicit errors.
 - Preserves complete original records and nested provenance in `shaders.sqlite`. Switch 1 and
   Switch 2 records remain separate. All packaged versions are scanned, including unused variants.
 - Audits deduplicated original Ampere instructions from SQLite, omitting graphics SPH headers.
@@ -143,6 +152,9 @@ Large NUP members and zstd output are streamed into temporary mapped files rathe
 256 MiB. That value is now an in-memory spill threshold. Temporary asset files are deleted when
 their scan finishes; full NUPs are never copied into result bundles. LZ4, Yaz0 and NSO images can
 also spill to mapped storage. Native codec buffers still depend on the individual encoded entry size.
+UnityFS decoded data also spills into temporary mapped storage; serialized objects are read through
+bounded views. Shader segments are decompressed per shader object. [UnityPy](https://github.com/K0lb3/UnityPy)
+is an MIT-licensed dependency installed by `setup.ps1`; no Unity scripts or game assemblies are executed.
 
 Traversal includes ONEPACK/Trinity pack files, Bezel Engine SCNE/ASST entries and NDVE/NDSR networks.
 Oodle-compressed Trinity files and ZBIC-compressed NSO segments use a small local codec subprocess.
@@ -166,6 +178,12 @@ instruction semantics or correct rendering. Each program stops at its first reje
 failures can appear after that instruction is fixed. Native programs generated, linked or patched
 at runtime cannot be exhaustively promised by static extraction. Zero recognized parser issues
 does not prove that every possible shader format was understood.
+
+Zero extracted native shaders stops the audit with an explicit error; it is not a compatibility
+pass. Encrypted Unreal containers, IoStore shader-library/group layouts, serialized Unreal
+shader-code libraries, encrypted UnityFS bundles and legacy UnityWeb/UnityRaw/UnityArchive bundles
+remain explicit extraction gaps until their respective formats are supported. A low nonzero count
+can still miss an unrecognized format.
 
 ## Setup on another checkout/computer
 

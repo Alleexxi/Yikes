@@ -7,6 +7,8 @@ import struct
 import time
 import mmap
 import tempfile
+import re
+import zlib
 from bisect import bisect_right
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +26,12 @@ from .large import Window, decoded_lz4, decoded_yaz0, decoded_zstd, digest, wind
 from .codecs import NativeDecoder
 from .trinity import entries as trinity_entries
 from .bea import members as bea_members
+from .iostore import MAGIC as IOSTORE, IoStore
+from .unreal import record as unreal_record, shader_tables
+from .unreal_pak import MAGIC as PAK_MAGIC, Pak
+from .unity import (bundle_members as unity_bundle, is_serialized as is_unity_asset,
+                    objects as unity_objects, graphics_programs, compute_programs,
+                    program_ranges as unity_program_ranges, text_asset, read_shader)
 from .storage import atomic_json, source_identity
 
 CONTROL = bytes.fromhex("34127698")
@@ -31,7 +39,7 @@ ZSTD = bytes.fromhex("28b52ffd")
 LZ4 = bytes.fromhex("04224d18")
 NATIVE = CONTROL + bytes.fromhex("c9000000")
 SHORT = ("vs", "hs", "ds", "gs", "ps", "cs", "ts", "ms", "rt")
-SCANNER_REVISION = 6
+SCANNER_REVISION = 8
 
 
 def plausible_control_header(header):
@@ -196,6 +204,9 @@ class Scanner:
         self.recovered = []
         self.identity = None
         self.native_decoder = None
+        self.unreal_decoded = {}
+        self.iostore_seen = set()
+        self.unity_schemas = {}
         if resume:
             saved = self.db.execute("SELECT value FROM state WHERE key='checkpoint'").fetchone()
             if saved is None:
@@ -211,6 +222,7 @@ class Scanner:
             self.unclaimed = [row for row in self.unclaimed
                               if plausible_control_header(bytes.fromhex(row['header_hex']))]
             self.recovered = previous["recovered"]
+            self.unity_schemas = previous.get('unity_schemas', {})
             self.identity = previous["identity"]
             self.elapsed_before_resume = previous["elapsed_seconds"]
             self.seen = {row[0] for row in self.db.execute("SELECT hash FROM blobs")}
@@ -224,6 +236,11 @@ class Scanner:
                 # their controls were subsequently claimed. Reparse those blobs too.
                 revisit.update(row[0] for row in self.db.execute(
                     "SELECT DISTINCT p.path FROM origins o JOIN paths p ON p.hash=o.blob WHERE o.format='BAHS'"))
+                revisit.update(path for path in roots if path.endswith(
+                    ('.ucas', '.utoc', '.pak', '.bundle', '.unity3d', '.ushaderbytecode')))
+                unity_roots = {path.rsplit('/', 1)[0] + '/' for path in roots
+                               if path.endswith(('/globalgamemanagers', '/globalgamemanagers.assets'))}
+                revisit.update(path for path in roots if any(path.startswith(prefix) for prefix in unity_roots))
                 for path in revisit:
                     prefix = path
                     while prefix:
@@ -470,8 +487,64 @@ class Scanner:
                 # Executables may contain the four-byte magic as an ordinary literal.
                 self.stats["GLSLC_magic_nonrecords"] += 1
 
-    def leaf(self, data, blob, label, depth=0):
+    def unreal_shaders(self, data, label, depth):
+        """Decode proven inline shader tables and exclude their packed bytes from matching."""
+        ranges, end = [], 0
+        for rows in shader_tables(data):
+            if rows[0][0] < end:
+                continue
+            valid = False
+            for at, packed, size, frequency in rows:
+                name = label + f'#ue-shader@{at:x}'
+                try:
+                    raw = span(data, at, packed)
+                    key = (hashlib.sha256(raw).digest(), size)
+                    cached = self.unreal_decoded.get(key)
+                    if cached is not None:
+                        self.db.execute('INSERT OR IGNORE INTO paths VALUES (?,?)', (name, cached))
+                        self.stats['duplicate_blobs'] += 1
+                    else:
+                        decoded = self.decode_native('oodle', raw, size) if packed != size else raw
+                        c = decoded.find(NATIVE)
+                        unreal_record(decoded, c)
+                        self.scan(decoded, name, depth + 1)
+                        self.unreal_decoded[key] = digest(decoded)
+                    valid = True
+                    self.stats['unreal_inline_shaders'] += 1
+                    ranges.append((at, at + packed))
+                except (ValueError, OSError, RuntimeError) as exc:
+                    self.issue(name, 'unreal_shader', exc)
+            if valid:
+                end = rows[-1][0] + rows[-1][1] + 5
+        return sorted(ranges)
+
+    def unity_asset(self, data, label, depth):
+        """Extract typed shader objects without matching compressed asset bytes as controls."""
+        self.stats['unity_serialized_assets'] += 1
+        for obj in unity_objects(data):
+            name = label + f'#unity-{obj.class_id}/{obj.path_id}'
+            try:
+                if obj.class_id == 49:
+                    self.scan(text_asset(obj), name + '/script', depth + 1)
+                    self.stats['unity_text_assets'] += 1
+                    continue
+                shader = read_shader(obj, self.unity_schemas)
+                programs = graphics_programs(shader) if obj.class_id == 48 else compute_programs(shader)
+                self.stats['unity_shader_objects' if obj.class_id == 48 else 'unity_compute_objects'] += 1
+                for variant, code, stage in programs:
+                    try:
+                        self.scan(code, name + '/' + variant, depth + 1,
+                                  unity_program=True, stage_hint=stage)
+                        self.stats['unity_program_entries'] += 1
+                    except (ValueError, RuntimeError, struct.error) as exc:
+                        self.issue(name + '/' + variant, 'unity_program', exc)
+            except Exception as exc:
+                self.issue(name, 'unity_object', exc)
+
+    def leaf(self, data, blob, label, depth=0, unreal=False):
         claimed = set()
+        packed_ranges = self.unreal_shaders(data, label, depth) if unreal else []
+        packed_index = 0
         markers = self.marker_finder.find(data)
         if data[:4] == b"BAHS":
             self.bahs(data, blob, label, claimed)
@@ -487,21 +560,33 @@ class Scanner:
         # sead primitive drawer: four absolute file offsets in the first sixteen bytes.
         if len(data) >= 16:
             cv, cp, kv, kp = unpack(data, "<4I", 0)
-            if data[cv:cv + 8] == NATIVE and data[cp:cp + 8] == NATIVE:
+            if data[cv:cv + 4] == CONTROL and data[cp:cp + 4] == CONTROL:
                 for c, k, stage in ((cv, kv, "vs"), (cp, kp, "ps")):
-                    size, = unpack(data, "<I", c + 0x30)
-                    length, = unpack(data, "<I", c + 0x44)
-                    claimed.add(self.add(data, blob, label, "SEAD", stage, c, max(size, 0x48), k, length))
+                    native = data[c:c + 8] == NATIVE
+                    size, = unpack(data, "<I", c + (0x30 if native else 0x20))
+                    length, = unpack(data, "<I", c + (0x44 if native else 0x704))
+                    claimed.add(self.add(data, blob, label, "SEAD", stage, c,
+                                         max(size, 0x48 if native else 0x708), k, length))
         # Some runtime libraries store a complete NVN2 control followed by its code directly.
         # Recover such records only when all declared bounds, stage and instruction ranges agree.
         for c in markers[CONTROL]:
             if c in claimed:
+                continue
+            while packed_index < len(packed_ranges) and packed_ranges[packed_index][1] <= c:
+                packed_index += 1
+            if packed_index < len(packed_ranges) and packed_ranges[packed_index][0] <= c:
                 continue
             if not plausible_control_header(data[c:c + 0x58]):
                 self.stats['control_magic_nonrecords'] += 1
                 continue
             native = data[c:c + 8] == NATIVE
             if native:
+                try:
+                    nc, k, nk = unreal_record(data, c)
+                    claimed.add(self.add(data, blob, label, 'UNREAL_NVN2', None, c, nc, k, nk, hex(c)))
+                    continue
+                except (ValueError, struct.error):
+                    pass
                 try:
                     own, = unpack(data, "<I", c + 0x30)
                     length, = unpack(data, "<I", c + 0x44)
@@ -542,19 +627,48 @@ class Scanner:
                     self.scan(value, label + f"#frame@{pos:x}", depth + 1)
                     self.stats["embedded_frames_decoded"] += 1
 
-    def scan(self, data, label, depth=0, *, verified_hash=None):
+    def scan(self, data, label, depth=0, *, verified_hash=None, iostore=None, unreal=False,
+             unity_program=False, stage_hint=None):
         if depth > 16:
             raise ValueError("nesting limit")
         blob = verified_hash if verified_hash is not None else digest(data)
         self.db.execute("INSERT OR IGNORE INTO paths VALUES (?,?)", (label, blob))
-        if blob in self.seen:
+        # The same UCAS payload can have a different TOC in another package.
+        # Its logical chunk ranges must be interpreted using that package's metadata.
+        context = (blob, digest(iostore[0].data), iostore[1]) if iostore is not None else None
+        duplicate = context in self.iostore_seen if context is not None else blob in self.seen
+        if duplicate:
             self.stats["duplicate_blobs"] += 1
             return
+        if context is not None:
+            self.iostore_seen.add(context)
         self.seen.add(blob)
         self.db.execute("INSERT OR IGNORE INTO blobs VALUES (?,?,?)", (blob, len(data), data[:8].hex()))
         self.stats["unique_decoded_blobs"] += 1
         self.magics[data[:4].hex()] += 1
-        if data[:4] == ZSTD:
+        if unity_program:
+            for stage, c, nc, k, nk in unity_program_ranges(data, stage_hint):
+                self.add(data, blob, label, 'UNITY', stage, c, nc, k, nk)
+        elif iostore is not None:
+            toc, partition, read_partition = iostore
+            self.stats['iostore_partitions'] += 1
+            for ordinal, (index, chunk_id, size) in enumerate(toc.entries(partition), 1):
+                name = label + '#io-' + chunk_id.hex()
+                try:
+                    with toc.read(index, read_partition, self.decode_native) as value:
+                        self.scan(value, name, depth + 1, unreal=True)
+                    if toc.version >= 4 and chunk_id[11] in (8, 9):
+                        self.issue(name, 'unsupported_shader_library',
+                                   'IoStore shader-library/group instruction ranges are not decoded')
+                    self.stats['iostore_chunks'] += 1
+                except (ValueError, OSError, RuntimeError, zlib.error, zstandard.ZstdError) as exc:
+                    self.issue(name, 'iostore_chunk', exc)
+                if ordinal % 5000 == 0:
+                    print(f'IoStore: {ordinal}/{toc.count} chunks; {len(self.written_native)} native programs; '
+                          f'{len(self.issues)} issues', flush=True)
+        elif data[:16] == IOSTORE:
+            IoStore(data)  # Validate metadata; raw TOC bytes are not shader records.
+        elif data[:4] == ZSTD:
             self.stats["zstd_layers"] += 1
             params = zstandard.get_frame_parameters(data[:18])
             dictionary = self.dictionaries.get(params.dict_id)
@@ -627,8 +741,75 @@ class Scanner:
                     self.scan(member, label + "/" + name, depth + 1)
                 except Exception as exc:
                     self.issue(label + "/" + name, "nested_member", exc)
+        elif label.endswith('.ushaderbytecode'):
+            self.issue(label, 'unsupported_shader_library', 'Serialized Unreal shader-code library is not decoded')
+        elif data[:8] == b'UnityFS\0':
+            self.stats['unity_bundles'] += 1
+            with unity_bundle(data) as members:
+                for name, member in members:
+                    try:
+                        self.scan(member, label + '/' + name, depth + 1)
+                    except Exception as exc:
+                        self.issue(label + '/' + name, 'unity_bundle_member', exc)
+        elif any(data[:len(magic)] == magic for magic in (b'UnityWeb\0', b'UnityRaw\0', b'UnityArchive\0')):
+            self.issue(label, 'unsupported_container', 'Legacy Unity bundle format is not supported')
+        elif is_unity_asset(data):
+            self.unity_asset(data, label, depth)
+        elif (label.endswith('.pak') or any(data[len(data) - back:len(data) - back + 4] == PAK_MAGIC
+                                           for back in (0xcc, 0xc8, 0x2c) if len(data) >= back + 1)):
+            archive = Pak(data)
+            self.stats['unreal_paks'] += 1
+            for name in archive.files:
+                try:
+                    with archive.read(name, self.decode_native) as value:
+                        self.scan(value, label + '/' + name, depth + 1, unreal=True)
+                    self.stats['unreal_pak_files'] += 1
+                except (ValueError, OSError, RuntimeError, zlib.error, zstandard.ZstdError) as exc:
+                    self.issue(label + '/' + name, 'unreal_pak_member', exc)
         else:
-            self.leaf(data, blob, label, depth)
+            self.leaf(data, blob, label, depth, unreal=unreal)
+
+    @contextmanager
+    def iostore_root(self, reader, members, label, data):
+        """Pair UCAS roots with verified TOCs and lazily open verified sibling partitions."""
+        if not label.endswith('.ucas'):
+            yield None
+            return
+        stem = label[:-5]
+        match = re.search(r'_s([0-9]+)(?=-|$)', stem) if stem + '.utoc' not in members else None
+        partition = int(match[1]) if match else 0
+        base = stem[:match.start()] + stem[match.end():] if match else stem
+        toc_name = base + '.utoc'
+        if toc_name not in members:
+            raise ValueError('UCAS member has no matching IoStore TOC')
+        with ExitStack() as stack:
+            index = members[toc_name]
+            metadata = stack.enter_context(reader.open_file(index))
+            if digest(metadata) != reader.files[index][2].hex():
+                raise ValueError('IoStore TOC NUP member SHA-256 mismatch')
+            toc = IoStore(metadata)
+            if partition >= toc.parts:
+                raise ValueError('UCAS partition exceeds TOC partition count')
+            opened = {partition: data}
+
+            def read_partition(part, offset, size):
+                if part not in opened:
+                    names = ([base + '.ucas'] if not part else
+                             [base + f'_s{part}.ucas',
+                              re.sub(r'(-[^/]+)$', lambda m: f'_s{part}' + m[0], base) + '.ucas'])
+                    if part:
+                        names = [name for name in names if name != base + '.ucas']
+                    name = next((name for name in names if name in members), names[0])
+                    if name not in members:
+                        raise ValueError(f'Missing IoStore partition {part}')
+                    index = members[name]
+                    value = stack.enter_context(reader.open_file(index))
+                    if digest(value) != reader.files[index][2].hex():
+                        raise ValueError('IoStore partition NUP member SHA-256 mismatch')
+                    opened[part] = value
+                return span(opened[part], offset, size)
+
+            yield toc, partition, read_partition
 
     @staticmethod
     def read_root(reader, index):
@@ -685,6 +866,7 @@ class Scanner:
                                    for name, index in walk(reader, package.root_dir))
             if len(all_members) != reader.file_count or len({index for _, index in all_members}) != reader.file_count:
                 raise ValueError("NUP roots do not form a complete tree of distinct file nodes")
+            member_indices = dict(all_members)
             package_dictionaries = {package.index: {} for package in reader.packages}
             for name, index in all_members:
                 if name.endswith("/Pack/ZsDic.pack.zs"):
@@ -730,7 +912,8 @@ class Scanner:
                         if actual != node[2].hex():
                             raise ValueError("NUP member SHA-256 mismatch")
                         issues_before = len(self.issues)
-                        self.scan(value, name, verified_hash=actual)
+                        with self.iostore_root(reader, member_indices, name, value) as iostore:
+                            self.scan(value, name, verified_hash=actual, iostore=iostore)
                     if len(self.issues) != issues_before:
                         status = 'failed'
                     else:
@@ -807,7 +990,8 @@ class Scanner:
         self.summary["recovered_parser_limit_issues"] = len(self.recovered)
         checkpoint = {**self.summary, 'identity': self.identity, 'issues': self.issues,
                       'all_magics': dict(self.magics), 'all_extensions': dict(self.extensions),
-                      'unclaimed': self.unclaimed, 'recovered': self.recovered}
+                      'unclaimed': self.unclaimed, 'recovered': self.recovered,
+                      'unity_schemas': self.unity_schemas}
         self.db.execute("INSERT OR REPLACE INTO state VALUES ('checkpoint',?)", (json.dumps(checkpoint),))
         self.db.commit()
         atomic_json(self.output / 'summary.json', self.summary)

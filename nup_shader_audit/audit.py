@@ -183,6 +183,9 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
               'Results do not cover all game shaders.', file=sys.stderr, flush=True)
     print('Verifying extracted shader hashes...', flush=True)
     expected, corpus_hash = verify_manifest(output)
+    if not expected:
+        raise ValueError('No native shaders were extracted; no instruction audit was performed. '
+                         'This is not a shader compatibility pass.')
     portable_sources = None
     if not (output / 'shaders.sqlite').is_file():
         _, portable_sources = portable_records(output)
