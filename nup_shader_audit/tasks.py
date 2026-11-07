@@ -34,13 +34,14 @@ def create_task(location, group_id=None, samples=3):
             match = NATIVE_NAME.fullmatch(case['file'])
             if match is None:
                 raise ValueError('Unsafe shader filename in report')
-            data = (output / 'native' / case['file']).read_bytes()
-            if hashlib.sha256(data).hexdigest() != match[1]:
-                raise ValueError('Shader sample no longer matches its extraction hash')
-            (directory / 'native' / case['file']).write_bytes(data)
             record = db.execute("SELECT key,control,code FROM shaders WHERE arch='sm86' AND stage=? AND instruction_hash=? LIMIT 1", (match[2], match[1])).fetchone()
             if record is None:
                 raise ValueError('Shader sample missing from provenance database')
+            begin = 0 if match[2] == 'cs' else 128
+            data = record[2][begin:begin + case['input_bytes']]
+            if len(data) != case['input_bytes'] or hashlib.sha256(data).hexdigest() != match[1]:
+                raise ValueError('Shader sample no longer matches its extraction hash')
+            (directory / 'native' / case['file']).write_bytes(data)
             (directory / (record[0] + '.control.bin')).write_bytes(record[1])
             (directory / (record[0] + '.code.bin')).write_bytes(record[2])
             examples.append({**case, 'record_key': record[0], 'sources': source_examples(db, case['file'])})

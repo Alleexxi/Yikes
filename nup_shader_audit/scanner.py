@@ -17,6 +17,7 @@ import zstandard
 
 from .binary import LIMIT, decompress, span, unpack, walk
 from .container.read import NupReader
+from .markers import MarkerFinder
 from .storage import atomic_json, source_identity
 
 CONTROL = bytes.fromhex("34127698")
@@ -108,26 +109,20 @@ def nso_image(data):
     return bytes(image)
 
 
-def find_all(data, magic):
-    offset = data.find(magic)
-    while offset >= 0:
-        yield offset
-        offset = data.find(magic, offset + len(magic))
-
-
 class Scanner:
-    def __init__(self, output, resume=False, checkpoint_every=5000, progress=None, workers=4):
+    def __init__(self, output, resume=False, checkpoint_every=5000, progress=None, workers=4,
+                 export_native=False):
         if checkpoint_every < 1:
             raise ValueError('checkpoint interval must be positive')
         self.checkpoint_every = checkpoint_every
         if workers < 1:
             raise ValueError('worker count must be positive')
         self.workers = workers
+        self.marker_finder = MarkerFinder()
         self.progress = progress
         self.output = output
         output.mkdir(parents=True, exist_ok=True)
         self.native_dir = output / "native"
-        self.native_dir.mkdir(exist_ok=True)
         self.db = sqlite3.connect(output / "shaders.sqlite")
         self.db.executescript("""
           PRAGMA journal_mode=WAL;
@@ -144,6 +139,19 @@ class Scanner:
           CREATE INDEX IF NOT EXISTS paths_by_hash ON paths(hash);
           CREATE INDEX IF NOT EXISTS shader_instructions ON shaders(instruction_hash,stage);
         """)
+        storage = self.db.execute("SELECT value FROM state WHERE key='native_storage'").fetchone()
+        if storage is not None and storage[0] not in ('files', 'sqlite'):
+            self.db.close()
+            raise ValueError('Unsupported native shader storage mode')
+        self.export_native = (storage is None or storage[0] == 'files') if resume else export_native
+        if resume and export_native and not self.export_native:
+            self.db.close()
+            raise ValueError('Cannot add --export-native on resume; choose a fresh output directory')
+        if self.export_native:
+            self.native_dir.mkdir(exist_ok=True)
+        if not resume:
+            self.db.execute("INSERT INTO state VALUES ('native_storage',?)",
+                            ('files' if export_native else 'sqlite',))
         self.seen = set()
         self.keys = set()
         self.written_native = set()
@@ -222,7 +230,8 @@ class Scanner:
             instruction_size = len(instructions)
             native_key = instruction_hash + "." + stage
             if native_key not in self.written_native:
-                (self.native_dir / (native_key + ".bin")).write_bytes(instructions)
+                if self.export_native:
+                    (self.native_dir / (native_key + ".bin")).write_bytes(instructions)
                 self.written_native.add(native_key)
         if key not in self.keys:
             self.db.execute("INSERT OR IGNORE INTO shaders VALUES (?,?,?,?,?,?,?)",
@@ -328,8 +337,8 @@ class Scanner:
             offset += 16
         self.stats["NDSR_containers"] += 1
 
-    def glslc(self, data, blob, label, claimed):
-        for base in find_all(data, bytes.fromhex("91688619")):
+    def glslc(self, data, blob, label, claimed, offsets):
+        for base in offsets:
             try:
                 version, = unpack(data, "<I", base + 0x30)
                 native = version == 0xc9
@@ -356,17 +365,18 @@ class Scanner:
 
     def leaf(self, data, blob, label, depth=0):
         claimed = set()
+        markers = self.marker_finder.find(data)
         if data[:4] == b"BAHS":
             self.bahs(data, blob, label, claimed)
         elif data[:4] == b"NDSR":
             self.ndsr(data, blob, label, claimed)
-        for base in find_all(data, b"BNSH\0\0\0\0"):
+        for base in markers[b"BNSH\0\0\0\0"]:
             try:
                 if not self.bnsh(data, blob, label, base, claimed):
                     self.stats["BNSH_magic_nonrecords"] += 1
             except (ValueError, struct.error) as exc:
                 self.issue(label + f"#BNSH@{base:x}", "shader_parser", exc)
-        self.glslc(data, blob, label, claimed)
+        self.glslc(data, blob, label, claimed, markers[bytes.fromhex("91688619")])
         # sead primitive drawer: four absolute file offsets in the first sixteen bytes.
         if len(data) >= 16:
             cv, cp, kv, kp = unpack(data, "<4I", 0)
@@ -377,7 +387,7 @@ class Scanner:
                     claimed.add(self.add(data, blob, label, "SEAD", stage, c, max(size, 0x48), k, length))
         # Some runtime libraries store a complete NVN2 control followed by its code directly.
         # Recover such records only when all declared bounds, stage and instruction ranges agree.
-        for c in find_all(data, CONTROL):
+        for c in markers[CONTROL]:
             if c in claimed:
                 continue
             native = data[c:c + 8] == NATIVE
@@ -402,7 +412,7 @@ class Scanner:
                                        "header_hex": data[c:c + 0x58].hex()})
         # Also look inside embedded compressed frames, e.g. a size/hash prefix before zstd.
         for magic in (ZSTD, LZ4):
-            for pos in find_all(data, magic):
+            for pos in markers[magic]:
                 if pos == 0:
                     continue
                 try:

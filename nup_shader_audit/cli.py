@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import __version__
 from .container.format import NupError
+from .corpus import uses_native_files
 from .adapter import ROOT
 from .audit import audit, load_report
 from .scanner import Scanner
@@ -33,7 +34,7 @@ def default_emulator():
     return sync_emulator()
 
 
-def scan_input(source, output, resume, checkpoint_every=5000, workers=4):
+def scan_input(source, output, resume, checkpoint_every=5000, workers=4, export_native=False):
     """Start a fresh extraction or resume its committed checkpoint."""
     if workers < 1 or checkpoint_every < 1:
         raise ValueError('worker count and checkpoint interval must be positive')
@@ -49,6 +50,8 @@ def scan_input(source, output, resume, checkpoint_every=5000, workers=4):
         raise ValueError('No extraction checkpoint exists; omit --resume for a fresh scan')
     if resume:
         with closing(sqlite3.connect(database.as_uri() + '?mode=ro', uri=True)) as db:
+            if export_native and not uses_native_files(db):
+                raise ValueError('Cannot add --export-native on resume; choose a fresh output directory')
             row = db.execute("SELECT value FROM state WHERE key='checkpoint'").fetchone()
         checkpoint = json.loads(row[0]) if row else {}
         if checkpoint.get('identity') != source_identity(source):
@@ -65,7 +68,8 @@ def scan_input(source, output, resume, checkpoint_every=5000, workers=4):
     if output.exists() and not database.exists() and any(output.iterdir()):
         raise ValueError('Fresh output must be empty')
     scanner = Scanner(output, resume=resume, checkpoint_every=checkpoint_every,
-                      progress=make_progress(f'Scan {source.name}'), workers=workers)
+                      progress=make_progress(f'Scan {source.name}'), workers=workers,
+                      export_native=export_native)
     try:
         scanner.run(source)
     finally:
@@ -104,7 +108,7 @@ def find_nups(folder):
 
 
 def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
-              checkpoint_every=5000, workers=4):
+              checkpoint_every=5000, workers=4, export_native=False):
     """Scan and audit every NUP under a folder, continuing after individual failures."""
     folder, nups = find_nups(folder)
     if not nups:
@@ -125,7 +129,8 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
             print(f'\n[{index}/{len(nups)}] {nup}', flush=True)
             try:
                 output = scan_input(nup, output, resume=(output / 'shaders.sqlite').is_file(),
-                                    checkpoint_every=checkpoint_every, workers=workers)
+                                    checkpoint_every=checkpoint_every, workers=workers,
+                                    export_native=export_native)
                 report, directory = audit(output, selected_emulator, allow_incomplete=allow_incomplete)
                 rejected = report['counts'].get('rejected', 0)
                 rejected_total += rejected
@@ -180,6 +185,8 @@ def parser():
         part.add_argument('nup', type=Path)
         part.add_argument('-o', '--output', type=Path)
         part.add_argument('--resume', action='store_true')
+        part.add_argument('--export-native', action='store_true',
+                          help='Also write individual native .bin files (slower; default stores bytes in SQLite)')
         part.add_argument('--checkpoint-every', type=int, default=5000, metavar='FILES',
                           help='Commit scan progress every N root files (default: 5000)')
         part.add_argument('--workers', type=int, default=4,
@@ -193,6 +200,8 @@ def parser():
     part.add_argument('--baseline', type=Path)
     part.add_argument('--allow-incomplete', action='store_true')
     part = subs.add_parser('batch', help='Scan and audit every NUP in a folder recursively')
+    part.add_argument('--export-native', action='store_true',
+                      help='Also write individual native .bin files for each game')
     part.add_argument('folder', type=Path)
     part.add_argument('-o', '--output', type=Path, help='Root folder for per-NUP results')
     part.add_argument('--emulator', type=Path)
@@ -236,9 +245,10 @@ def main(arguments=None):
             return tui()
         if args.command == 'batch':
             return run_batch(args.folder, args.output, args.emulator,
-                             args.allow_incomplete, args.checkpoint_every, args.workers)
+                             args.allow_incomplete, args.checkpoint_every, args.workers, args.export_native)
         if args.command in ('scan', 'run'):
-            output = scan_input(args.nup, args.output, args.resume, args.checkpoint_every, args.workers)
+            output = scan_input(args.nup, args.output, args.resume, args.checkpoint_every,
+                                args.workers, args.export_native)
             if args.command == 'scan':
                 value = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
                 return 2 if value['issue_count'] or value['unclaimed_control_candidates'] else 0

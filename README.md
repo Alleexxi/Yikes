@@ -66,6 +66,12 @@ detect incorrect rendering or semantic bugs in an instruction that the translato
 Scanning uses four threads to overlap NUP reads, decompression and hashing with ordered parsing and
 SQLite writes. Tune this with `--workers 8`, or use `--workers 1` for serial reads. The prefetch queue
 has a 128 MiB input budget; one larger member can be read alone. Hash verification is retained.
+On Windows x64 with MSVC available, scanning builds a small cached SIMD helper that finds the five
+leaf markers in a single pass. Without the compiler, or if the bounded match buffer fills up, it uses
+the original exhaustive Python searches. Neither path skips formats or validation.
+Shader bytes stay in SQLite by default and stream directly to the auditor. Use `--export-native`
+on a fresh `scan`, `run` or `batch` to also write individual `.bin` files; this costs extra file I/O.
+Resuming an older extraction preserves its original file storage and integrity checks.
 Batch reruns reuse completed extractions when the saved input identity still matches; every audit
 still verifies the extracted programs before testing the current translator.
 
@@ -114,18 +120,19 @@ code, commit, push or publish. Fixes happen in the coding agent's normal reviewe
   programs. Unsupported compression or unrecognized formats can still leave coverage gaps.
 - Preserves complete original records and nested provenance in `shaders.sqlite`. Switch 1 and
   Switch 2 records remain separate. All packaged versions are scanned, including unused variants.
-- Exports deduplicated original Ampere instructions under `native/`, omitting graphics SPH headers.
-  Input names are stored as metadata; exports use generated content hashes.
+- Audits deduplicated original Ampere instructions from SQLite, omitting graphics SPH headers.
+  Optional `--export-native` writes these under `native/`. Input names are stored as metadata;
+  exports use generated content hashes. Agent task packets export only the requested samples.
 - Builds a small C++ adapter against the selected emulator's actual current lowering header.
   It caches adapters by source, dependency and compiler-environment fingerprints. Only this one
   translation unit is built; the emulator does not need rebuilding for instruction tests.
 - Enables tensor lowering, follows geometry stage mode and uses an offline native base address of
   zero. A local diagnostic-only header copy owns error text as `std::string`; lowering is unchanged.
-- Checks every exported program's stage, size and SHA-256 before the audit. Stray files left by an
+- Checks every stored program's stage, size and SHA-256 before the audit. Stray files left by an
   interrupted batch are not included in the committed manifest.
 
 The first full scan traverses the entire container, overlapping root reads, decompression and hashing
-with ordered archive parsing. Later `audit` commands reuse the extraction. Export hash verification overlaps reads using eight workers;
+with ordered archive parsing. Later `audit` commands reuse the extraction. Legacy export hash verification overlaps reads using eight workers;
 checkpoint summaries are calculated every 5,000 roots rather than every progress update.
 
 Each audit gets its own directory under `audits/`, containing `report.json`, `REPORT.md`, raw

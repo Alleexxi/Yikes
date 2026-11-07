@@ -19,6 +19,7 @@ from nup_shader_audit.binary import LIMIT, decompress, walk
 from nup_shader_audit.cli import main, run_batch, scan_input
 from nup_shader_audit.container import format as F
 from nup_shader_audit.container.read import NupReader
+from nup_shader_audit.corpus import extraction_programs
 from nup_shader_audit.scanner import Scanner, yaz0
 from nup_shader_audit.tasks import create_task
 
@@ -177,7 +178,7 @@ class PipelineTests(unittest.TestCase):
     def test_changed_export_is_rejected(self):
         source = self.root / 'game.nup'
         make_nup(source, [('one', shader())])
-        output = scan_input(source, self.root / 'output', False)
+        output = scan_input(source, self.root / 'output', False, export_native=True)
         next((output / 'native').glob('*.bin')).write_bytes(UNKNOWN)
         with self.assertRaisesRegex(ValueError, 'changed'):
             verify_manifest(output)
@@ -186,7 +187,7 @@ class PipelineTests(unittest.TestCase):
         source = self.root / 'game.nup'
         programs = [shader(EXIT + struct.pack('<4I', 0x7918, i, 0, 0)) for i in range(80)]
         make_nup(source, [('many', archive(programs))])
-        output = scan_input(source, self.root / 'output', False)
+        output = scan_input(source, self.root / 'output', False, export_native=True)
         self.assertEqual(verify_manifest(output)[0], 80)
         file = next((output / 'native').glob('*.bin'))
         file.write_bytes(b'\0' * file.stat().st_size)
@@ -236,7 +237,7 @@ class PipelineTests(unittest.TestCase):
     def test_finished_resume_reuses_extraction_but_still_checks_program_hashes(self):
         source = self.root / 'game.nup'
         make_nup(source, [('one', shader())])
-        output = scan_input(source, self.root / 'output', False)
+        output = scan_input(source, self.root / 'output', False, export_native=True)
         with patch('nup_shader_audit.cli.Scanner') as scanner:
             self.assertEqual(scan_input(source, output, True), output)
             scanner.assert_not_called()
@@ -254,6 +255,36 @@ class PipelineTests(unittest.TestCase):
         for name in ('issues.json', 'unclaimed-controls.json'):
             self.assertEqual((serial / name).read_bytes(), (parallel / name).read_bytes())
         self.assertEqual(verify_manifest(serial), verify_manifest(parallel))
+
+    def test_database_only_scan_preserves_exports_and_checks_stored_bytes(self):
+        source = self.root / 'game.nup'
+        make_nup(source, [('pack', archive([shader(), shader(stage='cs'), shader(UNKNOWN + EXIT)]))])
+        output = scan_input(source, self.root / 'database', False)
+        exported = scan_input(source, self.root / 'files', False, export_native=True)
+        self.assertFalse((output / 'native').exists())
+        self.assertEqual(verify_manifest(output), verify_manifest(exported))
+        for filename, _, _, raw in extraction_programs(output):
+            self.assertEqual(raw, (exported / 'native' / filename).read_bytes())
+        with self.assertRaisesRegex(ValueError, 'Cannot add --export-native'):
+            scan_input(source, output, True, export_native=True)
+        with closing(sqlite3.connect(output / 'shaders.sqlite')) as db:
+            db.execute("UPDATE shaders SET code=zeroblob(length(code)) WHERE stage='cs'")
+            db.commit()
+        with self.assertRaisesRegex(ValueError, 'changed or is incomplete'):
+            verify_manifest(output)
+
+    def test_legacy_resume_keeps_native_files_and_integrity_checks(self):
+        source = self.root / 'game.nup'
+        make_nup(source, [('one', shader())])
+        output = scan_input(source, self.root / 'output', False, export_native=True)
+        with closing(sqlite3.connect(output / 'shaders.sqlite')) as db:
+            db.execute("DELETE FROM state WHERE key='native_storage'")
+            db.commit()
+        scan_input(source, output, True)
+        self.assertEqual(verify_manifest(output)[0], 1)
+        next((output / 'native').glob('*.bin')).write_bytes(UNKNOWN)
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            verify_manifest(output)
 
     def test_bahs_control_fields_are_not_mistaken_for_table_entries(self):
         record = shader()

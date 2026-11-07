@@ -6,6 +6,22 @@ from contextlib import closing
 from pathlib import Path
 
 
+def uses_native_files(db):
+    """Legacy caches exported separate files; new scans record their storage mode explicitly."""
+    row = db.execute("SELECT value FROM state WHERE key='native_storage'").fetchone()
+    if row is not None and row[0] not in ('files', 'sqlite'):
+        raise ValueError('Unsupported native shader storage mode')
+    return row is None or row[0] == 'files'
+
+
+def stored_programs(output):
+    """Stream either a compact export or the original extraction without loose files."""
+    if (Path(output) / 'corpus.sqlite').is_file():
+        yield from compact_programs(output)
+    else:
+        yield from extraction_programs(output)
+
+
 def compact_programs(output):
     """Stream a versioned corpus DB read-only; no separate shader files are needed."""
     path = (Path(output).resolve() / 'corpus.sqlite').as_uri() + '?mode=ro'

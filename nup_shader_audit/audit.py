@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapter import build_adapter
-from .corpus import compact_programs
+from .corpus import stored_programs, uses_native_files
 from .storage import atomic_json
 
 NATIVE_NAME = re.compile(r'([0-9a-f]{64})\.(vs|hs|ds|gs|ps|cs|ts|ms)\.bin\Z')
@@ -68,8 +68,10 @@ def portable_records(output):
 def verify_manifest(output):
     """Check every audited file against its DB or portable metadata, stage and content hash."""
     output = Path(output)
+    database_storage = (output / 'corpus.sqlite').is_file()
     if (output / 'shaders.sqlite').is_file():
         with connect(output) as db:
+            database_storage = database_storage or not uses_native_files(db)
             records = {(sha, stage): length for sha, stage, length in db.execute(
                 "SELECT instruction_hash,stage,instruction_bytes FROM shaders WHERE arch='sm86'")}
     else:
@@ -90,9 +92,9 @@ def verify_manifest(output):
     if seen != records.keys():
         raise ValueError('Manifest does not cover every extracted native program')
 
-    if (output / 'corpus.sqlite').is_file():
+    if database_storage:
         stored = set()
-        with closing(compact_programs(output)) as programs:
+        with closing(stored_programs(output)) as programs:
             for filename, stage, size, raw in programs:
                 match = NATIVE_NAME.fullmatch(filename)
                 key = (match[1], match[2]) if match else None
@@ -144,11 +146,11 @@ def compare_reports(before, after):
     return {'newly_accepted': improved, 'regressions': regressed, 'changed_first_failures': changed}
 
 
-def run_compact_adapter(output, executable, raw_report):
+def run_database_adapter(output, executable, raw_report):
     """Feed verified SQLite shader blobs directly to the adapter, avoiding tiny file exports."""
     with subprocess.Popen([str(executable), '--stdin', str(raw_report)], stdin=subprocess.PIPE) as process:
         try:
-            with closing(compact_programs(output)) as programs:
+            with closing(stored_programs(output)) as programs:
                 for filename, stage, size, raw in programs:
                     match = NATIVE_NAME.fullmatch(filename)
                     if (match is None or stage != match[2] or len(raw) != size
@@ -185,8 +187,12 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
     directory = output / 'audits' / name
     directory.mkdir(parents=True)
     raw_report = directory / 'lowering.tsv'
-    if (output / 'corpus.sqlite').is_file():
-        returncode = run_compact_adapter(output, executable, raw_report)
+    database_storage = (output / 'corpus.sqlite').is_file()
+    if portable_sources is None:
+        with connect(output) as db:
+            database_storage = database_storage or not uses_native_files(db)
+    if database_storage:
+        returncode = run_database_adapter(output, executable, raw_report)
     else:
         returncode = subprocess.run([str(executable), str(output / 'native-audit.tsv'), str(raw_report)]).returncode
     if returncode:
