@@ -37,6 +37,8 @@ def write_batch_bundle(output_root, entries, progress=None):
                 manifest.append(record)
                 lines.append(f'- {entry["name"]}: {entry["status"]}; '
                              f'{entry.get("rejected", 0)} rejected programs'
+                             + ('; WARNING: extraction coverage gaps'
+                                if entry.get('coverage_complete_for_recognized_formats') is False else '')
                              + (f'; {entry["error"]}' if entry.get('error') else ''))
                 output = Path(entry['output'])
                 for name in ('summary.json', 'issues.json', 'unclaimed-controls.json', 'recovered-issues.json'):

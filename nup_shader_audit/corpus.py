@@ -4,6 +4,7 @@ import hashlib
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from .binary import ray_module
 
 
 def uses_native_files(db):
@@ -39,9 +40,13 @@ def extraction_programs(output):
     path = (Path(output).resolve() / 'shaders.sqlite').as_uri() + '?mode=ro'
     with closing(sqlite3.connect(path, uri=True)) as db:
         rows = db.execute("SELECT instruction_hash,stage,instruction_bytes,"
-                          "substr(code,CASE WHEN stage='cs' THEN 1 ELSE 129 END,instruction_bytes) "
+                          "CASE WHEN stage='rt' THEN code ELSE "
+                          "substr(code,CASE WHEN stage='cs' THEN 1 ELSE 129 END,instruction_bytes) END,"
+                          "CASE WHEN stage='rt' THEN control ELSE NULL END "
                           "FROM shaders WHERE arch='sm86' GROUP BY instruction_hash,stage")
-        for sha, stage, size, raw in rows:
+        for sha, stage, size, raw, control in rows:
+            if stage == 'rt':
+                raw = ray_module(control, raw)
             yield f'{sha}.{stage}.bin', stage, size, raw
 
 

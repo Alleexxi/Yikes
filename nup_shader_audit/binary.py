@@ -7,10 +7,21 @@ import zstandard
 LIMIT = 256 * 1024 * 1024
 
 
-def span(data, offset, size):
-    """Return a bounded range; reject negative or truncated offsets."""
+def ray_module(control, code):
+    """Preserve a ray-tracing module's metadata and code without guessing instruction ranges."""
+    raw = struct.pack('<4sIII', b'NRTM', 1, len(control), len(code)) + control + code
+    return raw + bytes(-len(raw) % 16)
+
+
+def check_range(data, offset, size):
+    """Validate bounds without copying a potentially large mapped region."""
     if offset < 0 or size < 0 or offset > len(data) - size:
         raise ValueError(f"range {offset:#x}+{size:#x} exceeds {len(data):#x}")
+
+
+def span(data, offset, size):
+    """Return a bounded range; reject negative or truncated offsets."""
+    check_range(data, offset, size)
     return data[offset:offset + size]
 
 

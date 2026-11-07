@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 import subprocess
+import sys
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +18,7 @@ from .adapter import build_adapter
 from .corpus import stored_programs, uses_native_files
 from .storage import atomic_json
 
-NATIVE_NAME = re.compile(r'([0-9a-f]{64})\.(vs|hs|ds|gs|ps|cs|ts|ms)\.bin\Z')
+NATIVE_NAME = re.compile(r'([0-9a-f]{64})\.(vs|hs|ds|gs|ps|cs|ts|ms|rt)\.bin\Z')
 
 
 @contextmanager
@@ -175,6 +176,11 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
                          and extraction['root_status_counts'].get('ok') == extraction['expected_root_paths'])
     if not coverage_complete and not allow_incomplete:
         raise ValueError('Extraction has gaps; resume the scan, or explicitly use --allow-incomplete')
+    if not coverage_complete:
+        print(f'WARNING: auditing recovered shaders with incomplete extraction: '
+              f'{extraction["issue_count"]} issues; '
+              f'{extraction["unclaimed_control_candidates"]} unclaimed controls. '
+              'Results do not cover all game shaders.', file=sys.stderr, flush=True)
     print('Verifying extracted shader hashes...', flush=True)
     expected, corpus_hash = verify_manifest(output)
     portable_sources = None
@@ -206,6 +212,8 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
     groups = {}
     with (connect(output) if portable_sources is None else nullcontext(None)) as db:
         for row in cases:
+            if row['stage'] == 'rt':
+                row['representation'] = 'ray_tracing_module_with_control_metadata'
             row['error_offset'] = int(row['error_offset']) if row['error_offset'] else None
             row['input_bytes'] = int(row['input_bytes'])
             row['consumed_bytes'] = int(row['consumed_bytes'])
@@ -225,6 +233,8 @@ def audit(output, emulator, baseline=None, allow_incomplete=False):
               'limits': ['Stored variants may be unused; runtime-generated or patched outputs are not exhaustively enumerated.',
                          'Only native-to-Maxwell lowering is tested; acceptance does not prove rendering correctness.',
                          'Only the first rejection in each program is reported.']}
+    if any(row['stage'] == 'rt' for row in cases):
+        report['limits'].append('Ray tracing modules include full control metadata and code, but their instruction ranges are not decoded or lowered.')
     if baseline:
         report['comparison'] = compare_reports(load_report(baseline), report)
         report['baseline'] = str(Path(baseline).resolve())

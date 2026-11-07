@@ -5,26 +5,43 @@ import json
 import sqlite3
 import struct
 import time
+import mmap
+import tempfile
 from bisect import bisect_right
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
 
 import lz4.block
 import lz4.frame
 import zstandard
 
-from .binary import LIMIT, decompress, span, unpack, walk
+from .binary import LIMIT, check_range, decompress, ray_module, span, unpack, walk
 from .container.read import NupReader
 from .markers import MarkerFinder
+from .large import Window, decoded_lz4, decoded_yaz0, decoded_zstd, digest, window
+from .codecs import NativeDecoder
+from .trinity import entries as trinity_entries
+from .bea import members as bea_members
 from .storage import atomic_json, source_identity
 
 CONTROL = bytes.fromhex("34127698")
 ZSTD = bytes.fromhex("28b52ffd")
 LZ4 = bytes.fromhex("04224d18")
 NATIVE = CONTROL + bytes.fromhex("c9000000")
-SHORT = ("vs", "hs", "ds", "gs", "ps", "cs", "ts", "ms")
+SHORT = ("vs", "hs", "ds", "gs", "ps", "cs", "ts", "ms", "rt")
+SCANNER_REVISION = 6
+
+
+def plausible_control_header(header):
+    """Require a control structure, rather than a coincidental magic word in asset data."""
+    if header[:8] == NATIVE:
+        return True
+    if len(header) < 0x24 or header[:4] != CONTROL:
+        return False
+    own, = unpack(header, '<I', 0x20)
+    return 0x760 <= own < 0x10000
 
 
 def sarc(data):
@@ -43,7 +60,7 @@ def sarc(data):
         _, attribute, lo, hi = unpack(data, endian + "IIII", nodes + 16 * i)
         if lo > hi or start + lo < start:
             raise ValueError("SARC member range")
-        member = span(data, start + lo, hi - lo)
+        member = window(data, start + lo, hi - lo)
         total += len(member)
         if total > len(data) * 16:
             raise ValueError("overlapping SARC member budget")
@@ -90,23 +107,35 @@ def yaz0(data):
     return bytes(output)
 
 
-def nso_image(data):
+@contextmanager
+def nso_image(data, decode_native):
     flags, = unpack(data, "<I", 12)
     segments = []
     for i in range(3):
         offset, address, size, _ = unpack(data, "<4I", 0x10 + 16 * i)
         compressed_size, = unpack(data, "<I", 0x60 + 4 * i)
-        if address + size > LIMIT:
-            raise ValueError("NSO segment exceeds limit")
-        raw = span(data, offset, compressed_size if flags & (1 << i) else size)
-        decoded = lz4.block.decompress(raw, uncompressed_size=size) if flags & (1 << i) else raw
-        if len(decoded) != size:
-            raise ValueError("NSO segment length mismatch")
-        segments.append((address, decoded))
-    image = bytearray(max(address + len(value) for address, value in segments))
-    for address, value in segments:
-        image[address:address + len(value)] = value
-    return bytes(image)
+        segments.append((offset, address, size, compressed_size, bool(flags & (1 << i))))
+    total = max(address + size for _, address, size, _, _ in segments)
+    with tempfile.SpooledTemporaryFile(max_size=LIMIT) as image:
+        image.truncate(total)
+        for offset, address, size, compressed_size, compressed in segments:
+            raw = span(data, offset, compressed_size if compressed else size)
+            if compressed:
+                decoded = (decode_native('zbic', raw, size) if raw[:4] == b'ZBIC'
+                           else lz4.block.decompress(raw, uncompressed_size=size))
+            else:
+                decoded = raw
+            if len(decoded) != size:
+                raise ValueError("NSO segment length mismatch")
+            image.seek(address)
+            image.write(decoded)
+        if total <= LIMIT:
+            image.seek(0)
+            yield image.read()
+        else:
+            image.flush()
+            with mmap.mmap(image.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+                yield Window(mapped)
 
 
 class Scanner:
@@ -166,6 +195,7 @@ class Scanner:
         self.existing_roots = {}
         self.recovered = []
         self.identity = None
+        self.native_decoder = None
         if resume:
             saved = self.db.execute("SELECT value FROM state WHERE key='checkpoint'").fetchone()
             if saved is None:
@@ -176,6 +206,10 @@ class Scanner:
             self.extensions.update(previous.get('all_extensions', dict(previous["top_extensions"])))
             self.issues = previous["issues"]
             self.unclaimed = previous["unclaimed"]
+            # Saved candidate headers contain the fields needed to reject old magic-only
+            # false positives; shader bytes and their provenance remain unchanged.
+            self.unclaimed = [row for row in self.unclaimed
+                              if plausible_control_header(bytes.fromhex(row['header_hex']))]
             self.recovered = previous["recovered"]
             self.identity = previous["identity"]
             self.elapsed_before_resume = previous["elapsed_seconds"]
@@ -183,6 +217,29 @@ class Scanner:
             self.keys = {row[0] for row in self.db.execute("SELECT key FROM shaders")}
             self.written_native = {sha + '.' + stage for stage, sha in self.db.execute("SELECT DISTINCT stage,instruction_hash FROM shaders WHERE arch='sm86'")}
             self.existing_roots = dict(self.db.execute("SELECT file_index,status FROM roots"))
+            if previous.get('scanner_revision') != SCANNER_REVISION:
+                roots = {path: index for index, path in self.db.execute('SELECT file_index,path FROM roots')}
+                revisit = {row['path'] for row in self.unclaimed}
+                # Earlier heuristic BAHS scans can have stored false records even when
+                # their controls were subsequently claimed. Reparse those blobs too.
+                revisit.update(row[0] for row in self.db.execute(
+                    "SELECT DISTINCT p.path FROM origins o JOIN paths p ON p.hash=o.blob WHERE o.format='BAHS'"))
+                for path in revisit:
+                    prefix = path
+                    while prefix:
+                        if prefix in roots:
+                            index = roots[prefix]
+                            self.existing_roots[index] = 'retry'
+                            self.db.execute("UPDATE roots SET status='retry' WHERE file_index=?", (index,))
+                            break
+                        end = max(prefix.rfind('/'), prefix.rfind('#'))
+                        prefix = prefix[:end] if end >= 0 else ''
+
+    def decode_native(self, kind, raw, size):
+        """Start native archive codecs only when a member actually requires them."""
+        if self.native_decoder is None:
+            self.native_decoder = NativeDecoder()
+        return self.native_decoder.decode(kind, raw, size)
 
     def issue(self, label, kind, reason):
         self.issues.append({"path": label, "kind": kind, "reason": str(reason)})
@@ -190,7 +247,7 @@ class Scanner:
     def stage(self, control, code):
         if control.startswith(NATIVE):
             kind = control[0x56] if len(control) > 0x56 else -1
-            if kind in (5, 6, 7):
+            if kind in (5, 6, 7, 8):
                 return SHORT[kind]
             word, = unpack(code, "<I", 0)
         else:
@@ -221,11 +278,14 @@ class Scanner:
         instruction_hash = None
         instruction_size = 0
         if native:
-            size, = unpack(control, "<I", 0x38)
-            begin = 0 if stage == "cs" else 0x80
-            if not begin < size <= len(code) or (size - begin) % 16:
-                raise ValueError(f"invalid native instruction range {begin:#x}..{size:#x} of {len(code):#x}")
-            instructions = code[begin:size]
+            if stage == 'rt':
+                instructions = ray_module(control, code)
+            else:
+                size, = unpack(control, "<I", 0x38)
+                begin = 0 if stage == "cs" else 0x80
+                if not begin < size <= len(code) or (size - begin) % 16:
+                    raise ValueError(f"invalid native instruction range {begin:#x}..{size:#x} of {len(code):#x}")
+                instructions = code[begin:size]
             instruction_hash = hashlib.sha256(instructions).hexdigest()
             instruction_size = len(instructions)
             native_key = instruction_hash + "." + stage
@@ -248,15 +308,15 @@ class Scanner:
         if span(data, base + 0x60, 4) != b"grsc":
             return False
         size, = unpack(data, "<I", base + 0x1c)
-        span(data, base, size)
+        check_range(data, base, size)
         count, table = unpack(data, "<IQ", base + 0x7c)
-        span(data, base + table, count * 0x40)
+        check_range(data, base + table, count * 0x40)
         for i in range(count):
             program, = unpack(data, "<Q", base + table + i * 0x40 + 0x10)
             if not program:
                 continue
             for si, stage in enumerate(SHORT):
-                slot = 8 + si * 8 if si < 6 else (0x40 if si == 6 else 0x48)
+                slot = (8, 16, 24, 32, 40, 48, 64, 72, 56)[si]
                 if base + program + slot + 8 > len(data):
                     continue
                 descriptor, = unpack(data, "<Q", base + program + slot)
@@ -279,7 +339,7 @@ class Scanner:
 
     def bahs(self, data, blob, label, claimed):
         region_size, region = unpack(data, "<II", 0x18)
-        span(data, region, region_size)
+        check_range(data, region, region_size)
         candidates = []
         for a in range(0, region - 15, 4):
             off, zero, size, rel = unpack(data, "<IIIi", a)
@@ -299,20 +359,67 @@ class Scanner:
             stage = self.stage(control, code)
             if stage:
                 candidates.append((a, c, size, region + off, n, stage))
-        control_ranges = sorted((c, c + n) for _, c, n, _, _, _ in candidates)
-        control_starts = []
-        control_ends = []
-        highest_end = 0
-        for start, end in control_ranges:
-            control_starts.append(start)
-            highest_end = max(highest_end, end)
-            control_ends.append(highest_end)
-        for a, c, nc, k, nk, stage in candidates:
-            # Prefix maxima preserve membership for nested and overlapping control ranges.
-            previous = bisect_right(control_starts, a) - 1
-            if previous >= 0 and a < control_ends[previous]:
-                self.stats["BAHS_control_field_false_entries"] += 1
-                continue
+        # The supported BAHS binary array has length-prefixed records whose
+        # descriptors start at +0x10. Prefer its exact boundaries over heuristics.
+        array_entries = None
+        if candidates:
+            array = min(row[0] for row in candidates) - 0x18
+            if 0x20 <= array <= region - 8:
+                array_size, count = unpack(data, '<II', array)
+                if 8 <= array_size <= region - array and 0 < count <= (array_size - 8) // 0x20:
+                    at, entries = array + 8, set()
+                    for _ in range(count):
+                        if at + 0x20 > array + array_size:
+                            break
+                        size, = unpack(data, '<I', at)
+                        if size < 0x20 or at + size > array + array_size:
+                            break
+                        entries.add(at + 0x10)
+                        at += size
+                    else:
+                        if at == array + array_size:
+                            array_entries = entries
+        if array_entries is not None:
+            valid = {hex(row[0]) for row in candidates if row[0] in array_entries}
+            old = self.db.execute("SELECT DISTINCT variant FROM origins WHERE blob=? AND format='BAHS'", (blob,)).fetchall()
+            self.db.executemany("DELETE FROM origins WHERE blob=? AND format='BAHS' AND variant=?",
+                                ((blob, variant) for variant, in old if variant not in valid))
+            for a, c, nc, k, nk, stage in candidates:
+                if a in array_entries:
+                    claimed.add(self.add(data, blob, label, 'BAHS', stage, c, nc, k, nk, hex(a)))
+                else:
+                    self.stats['BAHS_control_field_false_entries'] += 1
+            self.stats['BAHS_containers'] += 1
+            return
+        # Discard descriptors embedded in control headers before trusting their lengths:
+        # +0x38..+0x47 can imitate a descriptor with a much larger control range.
+        headers = []
+        for _, c, nc, _, _, _ in candidates:
+            if data[c:c + 8] == NATIVE:
+                own, = unpack(data, '<I', c + 0x30)
+                length = own if 0x58 <= own <= nc else 0x58
+            else:
+                own, = unpack(data, '<I', c + 0x20)
+                length = own if 0x760 <= own <= nc else min(nc, 0x880)
+            headers.append((c, c + length))
+
+        def outside_ranges(entries, ranges):
+            starts, ends = [], []
+            highest = 0
+            for start, end in sorted(ranges):
+                starts.append(start)
+                highest = max(highest, end)
+                ends.append(highest)
+            for entry in entries:
+                previous = bisect_right(starts, entry[0]) - 1
+                if previous >= 0 and entry[0] < ends[previous]:
+                    self.stats['BAHS_control_field_false_entries'] += 1
+                else:
+                    yield entry
+
+        candidates = list(outside_ranges(candidates, headers))
+        control_ranges = [(c, c + n) for _, c, n, _, _, _ in candidates]
+        for a, c, nc, k, nk, stage in outside_ranges(candidates, control_ranges):
             claimed.add(self.add(data, blob, label, "BAHS", stage, c, nc, k, nk, hex(a)))
         self.stats["BAHS_containers"] += 1
 
@@ -344,11 +451,11 @@ class Scanner:
                 native = version == 0xc9
                 size, = unpack(data, "<I", base + (0x5c if native else 0x44))
                 count, = unpack(data, "<I", base + (0x64 if native else 0x4c))
-                span(data, base, size)
+                check_range(data, base, size)
                 if not 0 < count <= 16:
                     continue
                 first, stride = (0xa8, 0x98) if native else (0x90, 0x90)
-                span(data, base + first, count * stride)
+                check_range(data, base + first, count * stride)
                 for i in range(count):
                     at = base + first + i * stride
                     section_size, section, kind = unpack(data, "<3I", at)
@@ -390,6 +497,9 @@ class Scanner:
         for c in markers[CONTROL]:
             if c in claimed:
                 continue
+            if not plausible_control_header(data[c:c + 0x58]):
+                self.stats['control_magic_nonrecords'] += 1
+                continue
             native = data[c:c + 8] == NATIVE
             if native:
                 try:
@@ -415,35 +525,27 @@ class Scanner:
             for pos in markers[magic]:
                 if pos == 0:
                     continue
-                try:
-                    if magic == ZSTD:
-                        frame = memoryview(data)[pos:]
-                        params = zstandard.get_frame_parameters(frame)
-                        if params.content_size not in (zstandard.CONTENTSIZE_UNKNOWN, zstandard.CONTENTSIZE_ERROR) and params.content_size > LIMIT:
-                            raise ValueError("embedded zstd exceeds limit")
-                        dictionary = self.dictionaries.get(params.dict_id)
-                        if params.dict_id and dictionary is None:
-                            raise ValueError("missing embedded zstd dictionary")
-                        # Decode just this frame, not all subsequent array/mipmap frames again.
-                        value = zstandard.ZstdDecompressor(dict_data=dictionary).decompress(frame, max_output_size=LIMIT)
-                    else:
-                        info = lz4.frame.get_frame_info(data[pos:])
-                        if info["content_size"] > LIMIT:
-                            raise ValueError("embedded LZ4 exceeds limit")
-                        dec = lz4.frame.LZ4FrameDecompressor()
-                        value = dec.decompress(data[pos:], max_length=LIMIT + 1)
-                        if not dec.eof or len(value) > LIMIT:
-                            raise ValueError("embedded LZ4 truncated or exceeds limit")
-                except (ValueError, RuntimeError, zstandard.ZstdError):
-                    self.stats["embedded_frame_nonrecords"] += 1
-                    continue
-                self.scan(value, label + f"#frame@{pos:x}", depth + 1)
-                self.stats["embedded_frames_decoded"] += 1
+                with ExitStack() as stack:
+                    try:
+                        if magic == ZSTD:
+                            frame = Window(data, pos)
+                            params = zstandard.get_frame_parameters(frame[:18])
+                            dictionary = self.dictionaries.get(params.dict_id)
+                            if params.dict_id and dictionary is None:
+                                raise ValueError("missing embedded zstd dictionary")
+                            value = stack.enter_context(decoded_zstd(frame, dictionary))
+                        else:
+                            value = stack.enter_context(decoded_lz4(Window(data, pos)))
+                    except (ValueError, RuntimeError, zstandard.ZstdError):
+                        self.stats["embedded_frame_nonrecords"] += 1
+                        continue
+                    self.scan(value, label + f"#frame@{pos:x}", depth + 1)
+                    self.stats["embedded_frames_decoded"] += 1
 
     def scan(self, data, label, depth=0, *, verified_hash=None):
-        if depth > 16 or len(data) > LIMIT:
-            raise ValueError("decoded size or nesting limit")
-        blob = verified_hash if verified_hash is not None else hashlib.sha256(data).hexdigest()
+        if depth > 16:
+            raise ValueError("nesting limit")
+        blob = verified_hash if verified_hash is not None else digest(data)
         self.db.execute("INSERT OR IGNORE INTO paths VALUES (?,?)", (label, blob))
         if blob in self.seen:
             self.stats["duplicate_blobs"] += 1
@@ -454,20 +556,69 @@ class Scanner:
         self.magics[data[:4].hex()] += 1
         if data[:4] == ZSTD:
             self.stats["zstd_layers"] += 1
-            self.scan(decompress(data, self.dictionaries), label + "#zstd", depth + 1)
+            params = zstandard.get_frame_parameters(data[:18])
+            dictionary = self.dictionaries.get(params.dict_id)
+            if params.dict_id and dictionary is None:
+                raise ValueError('missing zstd dictionary')
+            with decoded_zstd(data, dictionary) as decoded:
+                self.scan(decoded, label + "#zstd", depth + 1)
         elif data[:4] == b"Yaz0":
             self.stats["yaz0_layers"] += 1
-            self.scan(yaz0(data), label + "#yaz0", depth + 1)
+            with decoded_yaz0(data, yaz0) as decoded:
+                self.scan(decoded, label + "#yaz0", depth + 1)
         elif data[:4] == LZ4:
-            dec = lz4.frame.LZ4FrameDecompressor()
-            value = dec.decompress(data, max_length=LIMIT + 1)
-            if not dec.eof:
-                raise ValueError("LZ4 truncated or decoded limit exceeded")
             self.stats["lz4_layers"] += 1
-            self.scan(value, label + "#lz4", depth + 1)
+            with decoded_lz4(data) as value:
+                self.scan(value, label + "#lz4", depth + 1)
         elif data[:4] == b"NSO0":
             self.stats["nso_modules"] += 1
-            self.scan(nso_image(data), label + "#nso-image", depth + 1)
+            with nso_image(data, self.decode_native) as image:
+                self.scan(image, label + "#nso-image", depth + 1)
+        elif data[:4] == b'NDVE':
+            pack_length, = unpack(data, '<I', 0x0c)
+            models, = unpack(data, '<I', 0x14)
+            pack = 0x18 + models * 8
+            if data[pack:pack + 4] != b'NDSR':
+                raise ValueError('NDVE is missing its declared NDSR pack')
+            self.scan(window(data, pack, pack_length), label + '#ndsr', depth + 1)
+            if pack + pack_length < len(data):
+                self.scan(window(data, pack + pack_length, len(data) - pack - pack_length),
+                          label + '#networks', depth + 1)
+            self.stats['ndve_archives'] += 1
+        elif data[:4] == b'SCNE':
+            self.stats['bea_archives'] += 1
+            for name, packed, size in bea_members(data):
+                with ExitStack() as stack:
+                    if packed[:4] == ZSTD:
+                        params = zstandard.get_frame_parameters(packed[:18])
+                        dictionary = self.dictionaries.get(params.dict_id)
+                        if params.dict_id and dictionary is None:
+                            raise ValueError('Missing BEA zstd dictionary')
+                        value = stack.enter_context(decoded_zstd(packed, dictionary, expected_size=size))
+                    elif len(packed) == size:
+                        value = packed
+                    else:
+                        raise ValueError(f'Unsupported BEA compression: {len(packed)} -> {size}')
+                    self.scan(value, label + '/' + name, depth + 1)
+                    self.stats['bea_files'] += 1
+        elif data[:8] == b'ONEPACK\0':
+            self.stats['trinity_archives'] += 1
+            for ordinal, (pack_hash, file_hash, compression, size, packed) in enumerate(trinity_entries(data), 1):
+                name = label + f'#pack-{pack_hash:016x}/file-{file_hash:016x}'
+                try:
+                    if compression == 3:
+                        value = self.decode_native('oodle', packed, size)
+                    elif len(packed) == size:
+                        value = packed
+                    else:
+                        raise ValueError(f'Unsupported Trinity codec {compression}: {len(packed)} -> {size}')
+                    self.scan(value, name, depth + 1)
+                    self.stats['trinity_files'] += 1
+                except (ValueError, OSError, RuntimeError) as exc:
+                    self.issue(name, 'trinity_member', exc)
+                if ordinal % 5000 == 0:
+                    print(f'Trinity: {ordinal} files scanned; {len(self.written_native)} native programs; '
+                          f'{len(self.issues)} issues', flush=True)
         elif data[:4] == b"SARC":
             self.stats["sarc_archives"] += 1
             for name, member in sarc(data):
@@ -483,9 +634,20 @@ class Scanner:
     def read_root(reader, index):
         """Read/decompress one root and hash it, without touching scanner state or SQLite."""
         if reader.files[index][1] > LIMIT:
-            raise ValueError('NUP member exceeds limit')
+            raise ValueError('Large members must use the streaming reader')
         value = reader.read_file(index)
         return value, hashlib.sha256(value).hexdigest()
+
+    @contextmanager
+    def root_data(self, reader, index, future):
+        """Keep large mapped/decompressed members alive only while their root is scanned."""
+        if reader.files[index][1] > LIMIT:
+            print(f'\nStreaming large member ({reader.files[index][1] / 1024**3:.2f} GiB): '
+                  + reader.files[index][0].decode('utf-8', 'replace'), flush=True)
+            with reader.open_file(index) as value:
+                yield value, digest(value)
+        else:
+            yield future.result() if future else self.read_root(reader, index)
 
     def prefetch_roots(self, reader, members, executor):
         """Overlap root reads with parsing, retaining order and a 128 MiB queue budget."""
@@ -496,11 +658,12 @@ class Scanner:
                 name, index = members[position]
                 node = reader.files[index]
                 skip = self.existing_roots.get(index) == 'ok'
-                cost = node[1] + node[4] if not skip and node[1] <= LIMIT else 0
+                cost = node[1] + node[4] if not skip else 0
                 # One large root is allowed alone; several large roots cannot fill memory.
                 if pending and queued_bytes + cost > 128 * 1024 * 1024:
                     break
-                future = executor.submit(self.read_root, reader, index) if executor and not skip else None
+                future = (executor.submit(self.read_root, reader, index)
+                          if executor and not skip and node[1] <= LIMIT else None)
                 pending.append((position + 1, name, index, future, cost))
                 queued_bytes += cost
                 position += 1
@@ -563,11 +726,11 @@ class Scanner:
                         if path == name or path.startswith(name+'#') or path.startswith(name+'/'):
                             self.seen.discard(digest)
                 try:
-                    value, actual = future.result() if future else self.read_root(reader, index)
-                    if actual != node[2].hex():
-                        raise ValueError("NUP member SHA-256 mismatch")
-                    issues_before = len(self.issues)
-                    self.scan(value, name, verified_hash=actual)
+                    with self.root_data(reader, index, future) as (value, actual):
+                        if actual != node[2].hex():
+                            raise ValueError("NUP member SHA-256 mismatch")
+                        issues_before = len(self.issues)
+                        self.scan(value, name, verified_hash=actual)
                     if len(self.issues) != issues_before:
                         status = 'failed'
                     else:
@@ -587,6 +750,12 @@ class Scanner:
             self.stats["nup_file_table_count"] = reader.file_count
         if source_identity(source) != identity:
             raise ValueError("NUP changed while it was being scanned")
+        # A newer parser may invalidate old provenance; do not retain orphaned
+        # heuristic records or include their binaries in the new audit manifest.
+        self.db.execute('DELETE FROM shaders WHERE NOT EXISTS (SELECT 1 FROM origins o WHERE o.shader=shaders.key)')
+        self.keys = {row[0] for row in self.db.execute('SELECT key FROM shaders')}
+        self.written_native = {sha + '.' + stage for stage, sha in self.db.execute(
+            "SELECT DISTINCT stage,instruction_hash FROM shaders WHERE arch='sm86'")}
         manifest = self.output / 'native-audit.tsv'
         temporary_manifest = manifest.with_suffix('.tsv.tmp')
         with temporary_manifest.open("w", encoding="utf-8", newline="") as stream:
@@ -601,6 +770,8 @@ class Scanner:
     def close(self):
         """Close the checkpoint database, rolling back an interrupted uncommitted batch."""
         self.db.close()
+        if self.native_decoder is not None:
+            self.native_decoder.close()
 
     def write_summary(self, source, count, final):
         """Commit authoritative progress before publishing readable status files."""
@@ -608,6 +779,11 @@ class Scanner:
         self.stats['root_bytes_verified'] = self.db.execute("SELECT coalesce(sum(size),0) FROM roots WHERE actual_hash=expected_hash").fetchone()[0]
         self.stats['unique_decoded_blobs'] = self.db.execute('SELECT count(*) FROM blobs').fetchone()[0]
         # Counts of unique records are authoritative even after an interrupted/retried member.
+        record_stats = {arch + '_' + stage for arch in ('maxwell', 'sm86')
+                        for stage in (*SHORT, 'unique_records')}
+        for key in list(self.stats):
+            if key.endswith('_references') or key in record_stats:
+                self.stats[key] = 0
         for arch, stage, total in self.db.execute('SELECT arch,stage,count(*) FROM shaders GROUP BY arch,stage'):
             self.stats[arch + '_' + stage] = total
         for arch, total in self.db.execute('SELECT arch,count(*) FROM shaders GROUP BY arch'):
@@ -617,6 +793,7 @@ class Scanner:
         self.issues = list({json.dumps(row, sort_keys=True): row for row in self.issues}.values())
         self.unclaimed = list({json.dumps(row, sort_keys=True): row for row in self.unclaimed}.values())
         self.summary = {"source": str(source), "source_size": source.stat().st_size,
+                        "scanner_revision": SCANNER_REVISION,
                         "finished": final, "expected_root_paths": count, "stats": dict(self.stats),
                         "elapsed_seconds": round(self.elapsed_before_resume + time.monotonic() - self.started, 1),
                         "native_instruction_stage_blobs": len(self.written_native),

@@ -12,9 +12,12 @@ import hashlib
 import mmap
 import os
 import struct
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from . import format as F
+from ..binary import LIMIT
+from ..large import Window, decoded_zstd
 
 
 @dataclass(frozen=True)
@@ -225,3 +228,20 @@ class NupReader:
         if len(data) != size:
             raise F.NupError(f"size mismatch for {name!r}: {len(data)} != {size}")
         return data
+
+    @contextmanager
+    def open_file(self, file_index):
+        """Read small members normally and stream/map large ones without a size cutoff."""
+        name, size, sha, eoff, esz, codec = self.files[file_index]
+        if size <= LIMIT:
+            yield self.read_file(file_index)
+        elif codec == F.CODEC_RAW:
+            data = Window(self._mm, eoff, esz)
+            if len(data) != size:
+                raise F.NupError(f'size mismatch for {name!r}')
+            yield data
+        elif codec == F.CODEC_ZSTD:
+            with decoded_zstd(Window(self._mm, eoff, esz), expected_size=size) as data:
+                yield data
+        else:
+            raise F.NupError(f'unknown codec {codec}')

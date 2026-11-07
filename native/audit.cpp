@@ -73,6 +73,15 @@ int main(int argc, char** argv) {
         std::istream& binary = piped ? entries : input;
         binary.read(reinterpret_cast<char*>(instructions.data()), length);
         if (!binary) return 2;
+        if (stage == "rt") {
+            ++total;
+            ++bad;
+            const std::string reason = "unsupported ray tracing module: instruction ranges are not decoded";
+            ++reasons[reason];
+            report << name.string() << '\t' << stage << "\trejected\t0\t" << length
+                   << "\t\t\t\t" << reason << '\n';
+            continue;
+        }
         auto result = Shader::Ampere::LowerToMaxwell(instructions,
             {.geometry = stage == "gs", .tensor = true, .native_code_address = 0});
         ++total;

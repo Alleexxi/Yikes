@@ -43,6 +43,10 @@ during scanning and auditing.
 Batch mode creates a separate extraction and report per NUP, keeps going if one file fails, and shows
 scan and per-file progress bars. It searches subfolders too. The TUI asks for a folder, previews the
 NUPs found, then asks before starting.
+Batch and TUI runs require complete extraction by default. Explicit `batch --allow-incomplete`
+audits recovered shaders despite gaps; the console, reports and ZIP index retain the warning,
+and the batch returns 2 if any audit is incomplete. Single-game `run` and `audit` also require
+`--allow-incomplete` to proceed with gaps. Completed extractions remain available for retesting.
 
 Every batch also creates `batch-results-<timestamp>-<id>.zip` in the output folder. It contains a
 batch index, each game's reports and build metadata, scan coverage issues, and **every tested native
@@ -134,6 +138,24 @@ code, commit, push or publish. Fixes happen in the coding agent's normal reviewe
 The first full scan traverses the entire container, overlapping root reads, decompression and hashing
 with ordered archive parsing. Later `audit` commands reuse the extraction. Legacy export hash verification overlaps reads using eight workers;
 checkpoint summaries are calculated every 5,000 roots rather than every progress update.
+
+Large NUP members and zstd output are streamed into temporary mapped files rather than skipped at
+256 MiB. That value is now an in-memory spill threshold. Temporary asset files are deleted when
+their scan finishes; full NUPs are never copied into result bundles. LZ4, Yaz0 and NSO images can
+also spill to mapped storage. Native codec buffers still depend on the individual encoded entry size.
+
+Traversal includes ONEPACK/Trinity pack files, Bezel Engine SCNE/ASST entries and NDVE/NDSR networks.
+Oodle-compressed Trinity files and ZBIC-compressed NSO segments use a small local codec subprocess.
+Its source dependencies are fetched once from pinned, hash-verified revisions of
+[ooz](https://github.com/powzix/ooz) (GPL-3.0-or-later) and
+[ZBIC](https://github.com/kinnay/zbic), retaining their source license notices in `.cache`.
+Only those codec files are compiled. Older checkpoints revisit failed members and roots with
+unclaimed controls when the parser revision changes.
+
+Ray-tracing BNSH modules are preserved as `.rt.bin` NRTM envelopes containing their complete
+control metadata and code. They are included in regression ZIPs and reported as unsupported modules.
+Their instruction ranges are not yet decoded, so the auditor does not send their metadata or
+constant data through the instruction lowerer. These are explicit audit failures, not silently skipped shaders.
 
 Each audit gets its own directory under `audits/`, containing `report.json`, `REPORT.md`, raw
 `lowering.tsv` and `build-metadata.json`. `latest.json` points to the most recent completed audit.

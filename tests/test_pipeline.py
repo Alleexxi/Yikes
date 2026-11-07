@@ -325,11 +325,40 @@ class PipelineTests(unittest.TestCase):
         (folder / 'a.NUP').touch()
         (folder / 'nested' / 'b.nup').touch()
         with (patch('nup_shader_audit.cli.scan_input', side_effect=lambda source, output, **kwargs: output),
-              patch('nup_shader_audit.cli.audit', return_value=({'total': 4, 'counts': {'rejected': 1}, 'cases': []}, self.root)) as audit_call,
+              patch('nup_shader_audit.cli.audit', return_value=({'total': 4, 'counts': {'rejected': 1}, 'cases': [], 'coverage_complete_for_recognized_formats': True}, self.root)) as audit_call,
               patch('nup_shader_audit.cli.write_batch_bundle', return_value=self.root / 'results.zip')):
             result = run_batch(folder, self.root / 'results', 'fake-emulator')
         self.assertEqual(result, 1)
         self.assertEqual(audit_call.call_count, 2)
+
+    @unittest.skipUnless(Path(os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')).is_dir(), 'Emulator checkout needed')
+    def test_batch_can_explicitly_audit_partial_extraction_and_keeps_gaps_in_zip(self):
+        folder = self.root / 'games'
+        folder.mkdir()
+        make_nup(folder / 'partial.nup', [('mixed', archive([shader(), b'SARCbroken']))])
+        emulator = os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')
+        output = self.root / 'results'
+        self.assertEqual(main(['batch', str(folder), '--output', str(output), '--emulator', emulator,
+                               '--allow-incomplete']), 2)
+        with zipfile.ZipFile(next(output.glob('batch-results-*.zip'))) as package:
+            self.assertIsNone(package.testzip())
+            entry = json.loads(package.read('batch.json'))['entries'][0]
+            self.assertEqual(entry['status'], 'completed')
+            self.assertFalse(entry['coverage_complete_for_recognized_formats'])
+            self.assertEqual(entry['total'], 1)
+            self.assertIn('coverage gaps', package.read('BATCH.md').decode())
+            report = json.loads(package.read('games/partial.nup/audit/report.json'))
+            self.assertEqual(report['counts'], {'accepted': 1})
+            self.assertFalse(report['coverage_complete_for_recognized_formats'])
+            self.assertIn('games/partial.nup/corpus.sqlite', package.namelist())
+            self.assertTrue(json.loads(package.read('games/partial.nup/scan/issues.json')))
+        with self.assertRaisesRegex(ValueError, 'Extraction has gaps'):
+            audit(output / 'partial', emulator)
+        strict = self.root / 'strict'
+        self.assertEqual(main(['batch', str(folder), '--output', str(strict), '--emulator', emulator]), 2)
+        with zipfile.ZipFile(next(strict.glob('batch-results-*.zip'))) as package:
+            self.assertEqual(json.loads(package.read('batch.json'))['entries'][0]['status'], 'error')
+            self.assertFalse(any(name.endswith('/audit/report.json') for name in package.namelist()))
 
     @unittest.skipUnless(Path(os.environ.get('NUP_SHADER_EMULATOR', 'C:/dev/eglantine')).is_dir(), 'Emulator checkout needed')
     def test_real_batch_zip_has_portable_regression_corpora_and_no_nups(self):

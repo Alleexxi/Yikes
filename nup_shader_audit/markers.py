@@ -83,7 +83,7 @@ class MarkerFinder:
 
     def find(self, data):
         """Search bytes without copying them or retaining pointers beyond the native call."""
-        if self.function is None or len(data) < 1024:
+        if self.function is None or not isinstance(data, bytes) or len(data) < 1024:
             return python_markers(data)
         count = self.function(data, len(data), self.buffer, self.capacity)
         if count > self.capacity:

@@ -15,7 +15,7 @@ from .container.format import NupError
 from .corpus import uses_native_files
 from .adapter import ROOT
 from .audit import audit, load_report
-from .scanner import Scanner
+from .scanner import SCANNER_REVISION, Scanner
 from .storage import atomic_json, source_identity
 from .tasks import create_task
 from .upstream import git, sync_emulator
@@ -58,7 +58,8 @@ def scan_input(source, output, resume, checkpoint_every=5000, workers=4, export_
             raise ValueError('NUP changed since the checkpoint; choose a fresh output directory')
         summary_path = output / 'summary.json'
         summary = json.loads(summary_path.read_text(encoding='utf-8')) if summary_path.is_file() else {}
-        if (checkpoint.get('finished') and summary.get('finished')
+        if (checkpoint.get('scanner_revision') == SCANNER_REVISION
+                and checkpoint.get('finished') and summary.get('finished')
                 and summary.get('root_status_counts') == checkpoint.get('root_status_counts')
                 and (output / 'native-audit.tsv').is_file() and not checkpoint.get('issue_count')
                 and not checkpoint.get('unclaimed_control_candidates')
@@ -117,6 +118,7 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
                    ROOT / 'results' / re.sub(r'[^A-Za-z0-9._-]', '_', folder.name))
     selected_emulator = emulator or default_emulator()
     failures = 0
+    incomplete = 0
     rejected_total = 0
     batch_progress = make_progress(f'Batch ({len(nups)} NUPs)')
     entries = []
@@ -134,10 +136,16 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
                 report, directory = audit(output, selected_emulator, allow_incomplete=allow_incomplete)
                 rejected = report['counts'].get('rejected', 0)
                 rejected_total += rejected
+                coverage_complete = report['coverage_complete_for_recognized_formats']
+                if not coverage_complete:
+                    incomplete += 1
                 entry.update(status='completed', rejected=rejected, total=report['total'],
+                             coverage_complete_for_recognized_formats=coverage_complete,
                              report_directory=directory)
                 print(f'[{index}/{len(nups)}] finished: {report["total"]} shaders, '
-                      f'{rejected} rejected; report: {directory / "REPORT.md"}', flush=True)
+                      f'{rejected} rejected'
+                      + ('; WARNING: extraction has coverage gaps' if not coverage_complete else '')
+                      + f'; report: {directory / "REPORT.md"}', flush=True)
             except (ValueError, OSError, NupError, sqlite3.Error, struct.error, RuntimeError) as exc:
                 failures += 1
                 entry.update(status='error', error=str(exc))
@@ -149,8 +157,9 @@ def run_batch(folder, output_root=None, emulator=None, allow_incomplete=False,
             print(f'Batch ZIP: {archive}', flush=True)
     print(f'Batch complete: {len(nups) - failures}/{len(nups)} NUPs processed; '
           f'{rejected_total} shaders rejected; {failures} NUPs failed to scan or audit. '
+          f'{incomplete} audits have extraction coverage gaps. '
           f'Results: {output_root}', flush=True)
-    return 2 if failures else (1 if rejected_total else 0)
+    return 2 if failures or incomplete else (1 if rejected_total else 0)
 
 
 def tui():
@@ -205,7 +214,11 @@ def parser():
     part.add_argument('folder', type=Path)
     part.add_argument('-o', '--output', type=Path, help='Root folder for per-NUP results')
     part.add_argument('--emulator', type=Path)
-    part.add_argument('--allow-incomplete', action='store_true')
+    coverage = part.add_mutually_exclusive_group()
+    coverage.add_argument('--allow-incomplete', action='store_true', default=False,
+                          help='Explicitly audit recovered programs despite extraction gaps')
+    coverage.add_argument('--strict-coverage', dest='allow_incomplete', action='store_false',
+                          help='Refuse audits when extraction has coverage gaps (default)')
     part.add_argument('--checkpoint-every', type=int, default=5000, metavar='FILES')
     part.add_argument('--workers', type=int, default=4,
                       help='Parallel read/decompression/hash workers (default: 4)')
